@@ -727,6 +727,11 @@ class ScorePredictionWrapper(nn.Module):
             for adapter in self.adapters if adapter.active
         }
 
+        # NOTE: changed last output from output_per_adapter to the logits
+        # dimension is the same so works just fine by replacing
+        # NOTE: This is hardcoded but should work for now
+        output_per_adapter["model.2.0.adn.N"] = logits
+
         self.prediction = self.prediction_head(
             output_per_adapter
         )
