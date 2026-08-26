@@ -1,0 +1,39 @@
+# Latent-space test-time adaptation via gradient ascent on the predicted score.
+#
+# Adaptation sites are indices into the `adn.N` module list (same indexing as
+# model.swivels).  They are NOT the same as model.swivels: those three define what the
+# prediction head *reads*, these define where the affine transform is *applied*.
+#
+# Measured on PMRI threet-to-onepointfivet (predictor cleanHalf_0, logits variant):
+#   sites [-1]     -> d_mu +0.006, d_Dice -0.010   (logit recalibration: harmful)
+#   sites [0]      -> d_mu +0.068, d_Dice +0.046
+#   sites [0, 17]  -> d_mu +0.139, d_Dice +0.107   (best; turnover beyond step 60)
+#   sites [0,17,-1]-> d_mu +0.071, d_Dice +0.056   (peaks at step ~40, then collapses)
+adapt_sites: [0, 17]
+
+# optimizer for the latent parameters
+lr: 0.01
+max_steps: 1000  #20 # 100
+
+# stopping rule: fixed-steps | delta-mu-target | fg-drift
+#
+# mu-hat and kappa-hat rise monotonically even after the true Dice starts falling, so
+# they carry no stopping information.  Foreground-fraction drift is the most informative
+# label-free signal observed so far.
+stop_rule: fixed-steps
+delta_mu_target: 0.10
+fg_drift_tol: 0.15
+
+# trust region (0 disables)
+prox_weight: 0.0
+max_log_gamma: 0.0
+max_beta: 0.0
+
+# 'batch'  -> reset and re-fit per batch (matches the reported numbers)
+# 'domain' -> fit one shared parameter set on the whole target domain, then freeze
+granularity: batch
+domain_fit_batches: 8
+
+# fp32 for the inner loop: the head divides its input by 1000, so d mu-hat / d gamma is
+# ~1e-3 scaled and underflows in fp16.
+precision: fp32
