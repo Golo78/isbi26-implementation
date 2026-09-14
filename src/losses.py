@@ -72,6 +72,59 @@ def dice_per_class_loss(
 
     
 
+def soft_dice_from_logits(
+    logits: Tensor,
+    target_segmentation: Tensor,
+    num_classes: int = 4,
+    eps: float = 1e-6,
+    include_background: bool = False,
+) -> Tensor:
+    """Differentiable per-sample foreground Dice computed directly from logits.
+
+    The hard Dice used for reporting (`DiceMetric` on argmax/threshold labels) has zero
+    gradient almost everywhere, so it cannot drive gradient ascent.  This soft relaxation
+    replaces the one-hot prediction by the predicted class probabilities and is the
+    objective used by the ORACLE variant of the latent TTA (see `run_latent_tta`,
+    objective='oracle-dice'): it needs the ground truth and is therefore NOT deployable --
+    it measures the upper bound a perfect quality estimator could reach.
+
+    Agrees with the reported hard Dice in the limit of confident predictions and matches
+    its empty-empty convention (`ignore_empty=False`): both are 1.0 when prediction and
+    target are empty.
+
+    Args:
+        logits:              [B, 1, H, W] (binary, sigmoid) or [B, C, H, W] (softmax).
+        target_segmentation: [B, 1, H, W] or [B, H, W] integer labels.
+        num_classes:         number of classes including background.
+        include_background:  average over all classes instead of foreground only.
+
+    Returns:
+        Tensor: [B] soft Dice in (0, 1], differentiable w.r.t. `logits`.
+    """
+    if logits.shape[1] == 1:
+        fg = sigmoid(logits)
+        probs = cat([1.0 - fg, fg], dim=1)          # [B, 2, H, W]
+    else:
+        probs = torch.softmax(logits, dim=1)        # [B, C, H, W]
+
+    n_ch = probs.shape[1]
+    assert n_ch == num_classes, \
+        f'soft_dice_from_logits: {n_ch} predicted channels but num_classes={num_classes}'
+
+    tgt = target_segmentation
+    if tgt.dim() == probs.dim():
+        tgt = tgt.squeeze(1)
+    tgt_oh = one_hot(tgt.long().clamp_min(0), num_classes=n_ch)
+    tgt_oh = tgt_oh.moveaxis(-1, 1).to(probs.dtype)  # [B, C, H, W]
+
+    dims = tuple(range(2, probs.dim()))
+    intersection = (probs * tgt_oh).sum(dims)        # [B, C]
+    denominator = probs.sum(dims) + tgt_oh.sum(dims) # [B, C]
+    dice = (2.0 * intersection + eps) / (denominator + eps)
+
+    return dice.mean(1) if include_background else dice[:, 1:].mean(1)
+
+
 def hausdorff_loss(
     predicted_segmentation: Tensor, 
     target_segmentation: Tensor,

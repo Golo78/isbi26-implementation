@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Behavior
-CUDA_DEVICE=${CUDA_DEVICE:-6}
+CUDA_DEVICE=${CUDA_DEVICE:-7}
 TRAIN=${TRAIN:-True}
 TEST=${TEST:-True}
 LOGGING=${LOGGING:-True}
@@ -17,7 +17,7 @@ LAYERS=8
 TRAIN_TRANSFORMS='global_transforms'
 DIST='all'
 
-DATASETS=${DATASETS:-"mnmv2"}
+DATASETS=${DATASETS:-"pmri"}
 LOCATION_TARGET_SCORE_DELTA=${LOCATION_TARGET_SCORE_DELTA:-0.1}
 # Likelihood switch for gaussian vs beta regression
 LIKELIHOOD=${LIKELIHOOD:-beta}       # beta | betahomoscedastic | gaussian | mse
@@ -47,6 +47,7 @@ fi
 PREDICTION_HEAD=True
 HIDDEN_DIM=64
 SWIVELS='first-embedding-last'
+HOOK_PLACEMENT=${HOOK_PLACEMENT:-post}  # pre = swivel input (pre-InstanceNorm), post = swivel output (post-norm)
 CKPT_NAME=''
 
 ITERATIONS='0 1 2 3 4'
@@ -76,6 +77,7 @@ for ITER in ${ITERATIONS:-0}; do
                     "promise12"
                 #   "promise12-i2cvb"
                     "threet-to-onepointfivet"
+                    "onepointfivet-to-threet"
                 )
             else
                 echo "Unknown dataset '$DATA'" >&2; exit 2
@@ -130,6 +132,7 @@ for ITER in ${ITERATIONS:-0}; do
                     ++model.widen_factor="$WIDEN_FACTOR" \
                     ++model.layers="$LAYERS" \
                     ++model.swivels="$SWIVELS" \
+                    ++model.hook_placement="$HOOK_PLACEMENT" \
                     +trainer=score_predictor_trainer \
                     ++trainer.limit_train_batches="$N_BATCHES" \
                     ++trainer.max_epochs="$N_EPOCHS" \

@@ -261,7 +261,8 @@ def get_score_prediction_module(
             ScorePredictionAdapter(
                 swivel=swivel,
             ) for swivel in swivels
-        ])
+        ]),
+        placement=getattr(model_cfg, 'hook_placement', 'pre')
     )
     
     wrapper.freeze_normalization_layers()
@@ -646,19 +647,38 @@ class ScorePredictionAdapter(nn.Module):
 
 
 class ScorePredictionWrapper(nn.Module):
+    """Records the swivel features that feed the score prediction head.
+
+    `placement` selects where a swivel is read relative to the module it names:
+
+        'pre'  (default) forward PRE hook -- the head sees the module's INPUT.  For the
+               `adn.N` swivels (adn_ordering='NDA') that is the raw conv output, i.e.
+               *before* the InstanceNorm.  These are the previously trained heads.
+        'post' forward hook -- the head sees the module's OUTPUT, i.e. the normalized
+               features *after* the InstanceNorm.
+
+    The adapters are pass-through recorders either way, so the segmentation path is
+    unaffected by this choice; only the features handed to the head change.
+    """
+
     def __init__(
         self,
         model: nn.Module,
         prediction_head: nn.Module,
         adapters: nn.ModuleList,
         copy: bool = True,
+        placement: str = 'pre',
     ):
         super().__init__()
+        placement = str(placement).lower()
+        if placement not in ('pre', 'post'):
+            raise ValueError(f"placement must be 'pre' or 'post', got {placement!r}")
         self.model           = deepcopy(model) if copy else model
         self.prediction_head = prediction_head
         self.adapters        = adapters
         self.adapter_handles = {}
         self.transform       = False
+        self.placement       = placement
         self.model.eval()
 
         self.hook_adapters()
@@ -674,21 +694,34 @@ class ScorePredictionWrapper(nn.Module):
             hook   = self._get_hook(adapter)
             self.adapter_handles[
                 swivel
-            ] = layer.register_forward_pre_hook(hook)
+            ] = (
+                layer.register_forward_pre_hook(hook)
+                if self.placement == 'pre'
+                else layer.register_forward_hook(hook)
+            )
 
 
     def _get_hook(
         self,
         adapter: nn.Module
     ) -> Callable:
-        def hook_fn(
-            module: nn.Module, 
-            x: Tuple[torch.Tensor]
-        ) -> torch.Tensor:
-            # x, *_ = x # tuple, alternatively use x_in = x[0]
-            # x = adapter(x)
-            return adapter(x[0])
-        
+        if self.placement == 'pre':
+            def hook_fn(
+                module: nn.Module, 
+                x: Tuple[torch.Tensor]
+            ) -> torch.Tensor:
+                # x, *_ = x # tuple, alternatively use x_in = x[0]
+                # x = adapter(x)
+                return adapter(x[0])
+        else:
+            def hook_fn(
+                module: nn.Module,
+                x: Tuple[torch.Tensor],
+                out: torch.Tensor
+            ) -> torch.Tensor:
+                # post-norm: record the module's output instead of its input
+                return adapter(out)
+
         return hook_fn
     
 

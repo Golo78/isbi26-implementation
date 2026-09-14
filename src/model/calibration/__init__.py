@@ -15,6 +15,12 @@ Main classes:
 
 from .base import Calibrator, DistributionAdapter
 from .distributions import BetaAdapter, GaussianAdapter
+from .intervals import (
+    beta_credible_interval,
+    beta_pit,
+    interval_report,
+    format_interval_report,
+)
 # from .temperature import TemperatureCalibrator
 # from .kccd import KCCDCalibrator
 # from .metrics import (
@@ -34,6 +40,12 @@ __all__ = [
     # Distribution adapters
     'BetaAdapter', 
     'GaussianAdapter',
+
+    # Credible intervals / coverage of the Beta QC head
+    'beta_credible_interval',
+    'beta_pit',
+    'interval_report',
+    'format_interval_report',
     
     # Calibrators
     'TemperatureCalibrator',

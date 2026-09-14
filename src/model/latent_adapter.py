@@ -22,6 +22,38 @@ affine parameters they were constructed without.
 Recommended adaptation sites are indices [0, 17] of the `adn.N` modules (first encoder
 conv and penultimate decoder level).  Index -1 (`model.2.0.adn.N`) feeds the logits and
 adapting it raises mu-hat while *lowering* Dice, so it is excluded by default.
+
+`placement='pre'` (`attach_latent_adapters`) exists to *measure* the effect described
+above instead of asserting it: the adapter then runs as a forward PRE hook, prepended so
+that it fires before the `ScorePredictionAdapter` pre-hook and the head therefore reads
+the adapted features.  The segmentation path, however, still sees the affine annihilated
+by the InstanceNorm, so the expected signature is "mu-hat moves, logits do not".  The
+per-step `logit_drift` in the trace quantifies exactly that.
+
+Objectives (`run_latent_tta`)
+-----------------------------
+    'mu'          : ascend the predicted score mu-hat.  Deployable, label-free.
+    'oracle-dice' : ascend the *true* soft Dice.  Needs labels, is NOT deployable, and
+                    serves as the upper bound of what latent adaptation could achieve if
+                    the quality estimate were perfect.  Comparing the two isolates how
+                    much of the gain hinges on the mu-hat / true-Dice correlation.
+
+Independently of the objective, `kappa_weight > 0` adds a simultaneous descent on the
+predictive uncertainty of the QC head (Beta sigma, or -log kappa).
+
+Logit adapter (`adapt_logits=True`)
+-----------------------------------
+Adds one more per-sample, per-channel affine directly on the UNet OUTPUT, registered as a
+forward hook on `wrapper.model` itself.  `ScorePredictionWrapper.forward` uses that output
+both as the returned segmentation logits and as the head's last swivel, so segmentation and
+QC head see the same adapted logits.  For a binary (1-channel) network the hard mask is
+
+    exp(log_gamma) * z + beta > 0   <=>   z > -beta * exp(-log_gamma)
+
+i.e. on the hard segmentation a logit affine is *exactly* a per-image global threshold
+shift (gamma only acts as a temperature on the soft logits the head reads).  The
+threshold-shift oracle in `apps/eval_latent_tta.py` is therefore the label-informed
+optimum of what the logit adapter alone could do to the hard mask.
 """
 from __future__ import annotations
 
@@ -77,9 +109,11 @@ class LatentAffineAdapter(nn.Module):
       * are not wiped by `LightningModule.zero_grad()`.
     """
 
-    def __init__(self, swivel: str, channels: int, max_batch: int, device: str = 'cuda:0'):
+    def __init__(self, swivel: str, channels: int, max_batch: int, device: str = 'cuda:0',
+                 placement: str = 'post'):
         super().__init__()
         self.swivel = swivel
+        self.placement = placement  # 'post' (norm output) | 'pre' (norm input)
         self.channels = int(channels)
         self.max_batch = int(max_batch)
         self.device_str = device
@@ -158,28 +192,91 @@ class LatentAffineAdapter(nn.Module):
         return torch.exp(self.log_gamma[:n]) * x + self.beta[:n]
 
 
+LOGITS_SITE = 'logits'
+
+
 def attach_latent_adapters(
     wrapper: nn.Module,
     sites: Sequence[str],
     max_batch: int,
     input_shape: Sequence[int] = (1, 1, 384, 384),
     device: str = 'cuda:0',
+    placement: str = 'post',
+    adapt_logits: bool = False,
 ) -> Tuple[List[LatentAffineAdapter], List[torch.utils.hooks.RemovableHandle]]:
-    """Register post-norm affine adapters on `wrapper.model` at `sites`.
+    """Register affine adapters on `wrapper.model` at `sites`.
+
+    adapt_logits=True
+        Additionally appends an adapter with `swivel == LOGITS_SITE` acting on the UNet
+        output (forward hook on `wrapper.model`), independent of `placement`.  It is always
+        the LAST entry of the returned list.
+
+    placement='post' (default)
+        Forward hook on the norm's OUTPUT -- the affine survives, so both the segmentation
+        and the QC head see it.  These are the reported numbers.
+
+    placement='pre'
+        Forward PRE hook on the norm's INPUT, registered with `prepend=True` so it runs
+        before the `ScorePredictionWrapper` pre-hook that records the swivel features.
+        The head therefore reads adapted features, while the segmentation path sees
+        `IN(gamma*x + beta) == IN(x)`, i.e. the affine annihilated (up to eps and
+        sign(gamma)).  Use it to measure how much of a mu-hat gain is head-side only.
 
     Returns a plain list (NOT an nn.ModuleList) on purpose -- see LatentAffineAdapter.
     """
+    placement = str(placement).lower()
+    if placement not in ('post', 'pre'):
+        raise ValueError(f"placement must be 'post' or 'pre', got {placement!r}")
+
+    # adn.N is shape-preserving, so the recorded output shape is also the input shape and
+    # the channel count is valid for either placement.
     shapes = find_shapes_for_swivels(wrapper.model, list(sites), tuple(input_shape))
+    if adapt_logits:
+        # before any adapter hook exists, so this is the plain network output
+        with torch.no_grad():
+            shapes[LOGITS_SITE] = list(
+                wrapper.model(torch.zeros(tuple(input_shape), device=device)).shape
+            )
     adapters: List[LatentAffineAdapter] = []
     handles = []
     for site in sites:
         adapter = LatentAffineAdapter(
             swivel=site, channels=shapes[site][1], max_batch=max_batch, device=device,
+            placement=placement,
         )
         adapters.append(adapter)
         layer = wrapper.model.get_submodule(site)
-        # NOTE post hook, and `a=adapter` to bind now (late binding in a loop is a real bug)
-        handles.append(layer.register_forward_hook(lambda m, inp, out, a=adapter: a(out)))
+        # NOTE `a=adapter` binds now (late binding in a loop is a real bug)
+        if placement == 'post':
+            # prepend: a post-norm score predictor (hook_placement='post') records the
+            # norm output with its own forward hook, registered earlier.  Hooks run in
+            # registration order, so without prepend the head would read the UNadapted
+            # features at every site that is also one of its swivels.
+            handles.append(
+                layer.register_forward_hook(
+                    lambda m, inp, out, a=adapter: a(out), prepend=True
+                )
+            )
+        else:
+            # prepend: must run before ScorePredictionWrapper's recording pre-hook,
+            # otherwise the head would read the *un*adapted features and the experiment
+            # would silently measure nothing.
+            handles.append(
+                layer.register_forward_pre_hook(
+                    lambda m, inp, a=adapter: a(inp[0]), prepend=True
+                )
+            )
+    if adapt_logits:
+        adapter = LatentAffineAdapter(
+            swivel=LOGITS_SITE, channels=shapes[LOGITS_SITE][1], max_batch=max_batch,
+            device=device, placement='post',
+        )
+        adapters.append(adapter)
+        # hook on the network root: fires after the full forward (all swivel recordings are
+        # done), and its return value replaces the logits ScorePredictionWrapper sees.
+        handles.append(
+            wrapper.model.register_forward_hook(lambda m, inp, out, a=adapter: a(out))
+        )
     return adapters, handles
 
 
@@ -307,81 +404,173 @@ def run_latent_tta(
     max_beta: float = 0.0,
     reset: bool = True,
     score_fn: Optional[Callable[[Tensor], Tensor]] = None,
+    objective: str = 'mu',
+    oracle_fn: Optional[Callable[[Tensor], Tensor]] = None,
+    kappa_weight: float = 0.0,
+    kappa_objective: str = 'sigma',
+    logit_lr: Optional[float] = None,
 ) -> Dict:
-    """Adapt the latent features of `x` by ascending mu-hat, then return the result.
+    """Adapt the latent features of `x` by gradient ascent, then return the result.
 
     Runs in whatever autograd/precision context the caller provides; the caller is
     expected to use fp32 (the head divides its input by 1000, so d mu-hat / d gamma is
     already ~1e-3 scaled and underflows in fp16).
 
-    `score_fn(logits) -> [B]` is an optional *diagnostic* callback for the true score.
-    It is used for reporting only and never touches the objective -- keep it that way,
-    the ground truth must not leak into the adaptation.
+    Objective
+    ---------
+    objective='mu'
+        Ascend the predicted score mu-hat.  Label-free and deployable.
+    objective='oracle-dice'
+        Ascend the TRUE (soft) Dice supplied by `oracle_fn(logits) -> [B]`, which must be
+        differentiable w.r.t. the logits.  This uses the ground truth and is therefore an
+        ORACLE: not deployable, but it bounds what latent adaptation could deliver if the
+        quality estimate were perfect, and the gap to objective='mu' is exactly the price
+        of an imperfect mu-hat / true-Dice correlation.
+
+    `kappa_weight > 0` additionally descends the QC head's predictive uncertainty at every
+    step (simultaneously, in one combined objective, not in an alternating scheme):
+
+        kappa_objective='sigma'      : objective - w * sigma,      sigma = sqrt(mu(1-mu)/(kappa+1))
+        kappa_objective='log-kappa'  : objective + w * log(kappa)
+
+    `score_fn(logits) -> [B]` is a *diagnostic* callback for the true (hard) score.  It is
+    used for reporting only and must never touch the objective -- with objective='mu' the
+    ground truth must not leak into the adaptation.
 
     Returns a dict with the adapted logits, the predictor output, the per-step trace and
     `per_step`, which holds the SAME quantities at per-sample resolution:
 
         per_step['mu']         : [B, S]   predicted score after k steps
-        per_step['true_score'] : [B, S]   true score after k steps (only if score_fn given)
+        per_step['kappa']      : [B, S]   predicted concentration after k steps
+        per_step['sigma']      : [B, S]   Beta std implied by (mu, kappa)
+        per_step['true_score'] : [B, S]   true hard score after k steps (only if score_fn)
+        per_step['soft_dice']  : [B, S]   true soft Dice after k steps (only if oracle_fn)
+        per_step['logit_drift']: [B, S]   mean |logits - logits_0|, 0 at step 0
 
     where S = steps_taken + 1 and column 0 is the un-adapted reference.  The `trace`
     entries are batch means of these, kept scalar because `should_stop` compares them.
     The per-sample matrices are what lets you locate the best step *per image* after the
     fact -- an oracle read-out (it needs labels), for analysis only.
+
+    `logit_drift` is the placement diagnostic: with `placement='pre'` the affine is
+    annihilated by the InstanceNorm, so the segmentation cannot move and this stays ~0
+    even while mu-hat climbs.
+
+    `logit_lr` sets a separate Adam learning rate for the logit adapter (swivel
+    LOGITS_SITE); None uses `lr`.  Adam steps are ~lr in parameter units, and one unit of
+    logit beta is a much larger change than one unit of a latent beta.
+
+    If `score_fn` is given, `best_pred` [B,1,H,W] (uint8 labels) holds each sample's hard
+    prediction at its best step by true score (first maximum, same as argmax over
+    `per_step['true_score']`) -- an oracle read-out for qualitative analysis only.
     """
+    objective = str(objective).lower()
+    if objective not in ('mu', 'oracle-dice'):
+        raise ValueError(f"objective must be 'mu' or 'oracle-dice', got {objective!r}")
+    if objective == 'oracle-dice' and oracle_fn is None:
+        raise ValueError("objective='oracle-dice' requires a differentiable `oracle_fn`")
+    kappa_objective = str(kappa_objective).lower()
+    if kappa_weight and kappa_objective not in ('sigma', 'log-kappa'):
+        raise ValueError(f"unknown kappa_objective {kappa_objective!r}")
+
     if reset:
         reset_adapters(adapters)
     params = latent_parameters(adapters)
     for p in params:
         p.requires_grad_(True)
-    opt = torch.optim.Adam(params, lr=lr)
+    groups = [{'params': a.parameters_list()} for a in adapters if a.swivel != LOGITS_SITE]
+    groups += [
+        {'params': a.parameters_list(), 'lr': lr if logit_lr is None else logit_lr}
+        for a in adapters if a.swivel == LOGITS_SITE
+    ]
+    opt = torch.optim.Adam(groups, lr=lr)
 
     trace: List[Dict[str, float]] = []
     # per-sample counterparts of the trace scalars, one [B] tensor per step
     mu_steps: List[Tensor] = []
+    kappa_steps: List[Tensor] = []
+    sigma_steps: List[Tensor] = []
     score_steps: List[Tensor] = []
+    soft_steps: List[Tensor] = []
+    drift_steps: List[Tensor] = []
     logits = None
     prediction = None
+    logits0 = None
+    best_score: Optional[Tensor] = None
+    best_pred: Optional[Tensor] = None
 
     step = 0
     while True:
         with torch.enable_grad():
             logits = wrapper(x)
             prediction = wrapper.prediction
-            mu = prediction[:, 0, 0].clamp(1e-6, 1 - 1e-6)  # expected segmentation quality 
+            mu = prediction[:, 0, 0].clamp(1e-6, 1 - 1e-6)  # expected segmentation quality
             kappa = prediction[:, 0, 1].clamp_min(1e-6)     # confidence in mu-hat (inverse variance)
+            sigma = (mu * (1 - mu) / (kappa + 1)).sqrt()    # predictive std of the Beta
+            # differentiable true Dice -- only entering the objective when objective='oracle-dice',
+            # otherwise computed for reporting only (and detached below).
+            soft_dice = oracle_fn(logits) if oracle_fn is not None else None
 
         with torch.no_grad():
+            if logits0 is None:
+                logits0 = logits.detach().clone()
             binary = logits.shape[1] == 1
             fg = ((logits > 0) if binary else (logits.argmax(1, keepdim=True) > 0))
+            drift = (logits - logits0).abs().flatten(1).mean(1).detach().cpu()
             rec = {
                 'step': step,
                 'mu': mu.mean().item(),
                 'kappa': kappa.mean().item(),
-                'sigma': (mu * (1 - mu) / (kappa + 1)).sqrt().mean().item(),
+                'sigma': sigma.mean().item(),
                 'fg_frac': fg.float().mean().item(),
+                'logit_drift': float(drift.mean().item()),
             }
             mu_steps.append(mu.detach().cpu())
+            kappa_steps.append(kappa.detach().cpu())
+            sigma_steps.append(sigma.detach().cpu())
+            drift_steps.append(drift)
+            if soft_dice is not None:
+                sd = soft_dice.detach().cpu()
+                soft_steps.append(sd)
+                rec['soft_dice'] = float(sd.mean().item())
             if score_fn is not None:
                 # keep the per-sample vector; the trace scalar is just its mean
                 s = score_fn(logits).detach().cpu()
                 score_steps.append(s)
                 rec['true_score'] = float(s.mean().item())
+                hard = (fg if binary else logits.argmax(1, keepdim=True)).to(torch.uint8)
+                if best_score is None:
+                    best_score, best_pred = s.clone(), hard.clone()
+                else:
+                    better = s > best_score  # strict: ties keep the earliest step
+                    best_score = torch.where(better, s, best_score)
+                    best_pred[better.to(hard.device)] = hard[better.to(hard.device)]
             trace.append(rec)
 
         if should_stop(stop_rule, trace, max_steps=max_steps,
                        delta_mu_target=delta_mu_target, fg_drift_tol=fg_drift_tol):
             break
 
-        # NOTE:  mu entspricht label-freier Schätzung des Dice-Scores. 
-        # Wenn Mu-Hat _genauer_ Schätzer, dann zeigt Delta-Mu-Hat in Richtung, die den echten Dice verbessert.
-        #  
-        objective = mu.mean() 
+        # NOTE:  mu entspricht label-freier Schaetzung des Dice-Scores.
+        # Wenn Mu-Hat _genauer_ Schaetzer, dann zeigt Delta-Mu-Hat in Richtung, die den echten Dice verbessert.
+        # Die Orakel-Variante ersetzt genau diesen Schaetzer durch den echten (weichen) Dice.
+        if objective == 'mu':
+            obj = mu.mean()
+        else:
+            obj = soft_dice.mean()
+
+        # simultaneous descent on the predicted uncertainty (kappa_weight = 0 disables)
+        if kappa_weight:
+            if kappa_objective == 'sigma':
+                obj = obj - kappa_weight * sigma.mean()
+            else:  # 'log-kappa'
+                obj = obj + kappa_weight * torch.log(kappa).mean()
+
         # currently not in use, but could be re-enabled if we want to keep the adapted parameters close to the identity
         # if prox_weight > 0:
-        #     objective = objective - prox_weight * latent_penalty(adapters)
+        #     obj = obj - prox_weight * latent_penalty(adapters)
         opt.zero_grad(set_to_none=True)
-        (-objective).backward() # Adam minimizes, so we negate the objective to ascend towards higher mu-hat
+        (-obj).backward()  # Adam minimizes, so we negate the objective to ascend
         opt.step()
         # currently not in use, but could be re-enabled if we want to keep the adapted parameters close to the identity
         # for a in adapters:
@@ -394,9 +583,16 @@ def run_latent_tta(
         prediction = wrapper.prediction
 
     # stack over steps -> [B, S], so row i is the full trajectory of sample i
-    per_step: Dict[str, Tensor] = {'mu': torch.stack(mu_steps, dim=1)}
+    per_step: Dict[str, Tensor] = {
+        'mu': torch.stack(mu_steps, dim=1),
+        'kappa': torch.stack(kappa_steps, dim=1),
+        'sigma': torch.stack(sigma_steps, dim=1),
+        'logit_drift': torch.stack(drift_steps, dim=1),
+    }
     if score_steps:
         per_step['true_score'] = torch.stack(score_steps, dim=1)
+    if soft_steps:
+        per_step['soft_dice'] = torch.stack(soft_steps, dim=1)
 
     return {
         'logits': logits.detach(),
@@ -404,4 +600,7 @@ def run_latent_tta(
         'trace': trace,
         'steps_taken': len(trace) - 1,
         'per_step': per_step,
+        'objective': objective,
+        'kappa_weight': float(kappa_weight),
+        'best_pred': best_pred,
     }
