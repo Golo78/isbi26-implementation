@@ -47,7 +47,7 @@ fi
 PREDICTION_HEAD=True
 HIDDEN_DIM=64
 SWIVELS='first-embedding-last'
-HOOK_PLACEMENT=${HOOK_PLACEMENT:-post}  # pre = swivel input (pre-InstanceNorm), post = swivel output (post-norm)
+HOOK_PLACEMENT=${HOOK_PLACEMENT:-pre}  # pre = swivel input (pre-InstanceNorm), post = swivel output (post-norm)
 CKPT_NAME=''
 
 ITERATIONS='0 1 2 3 4'

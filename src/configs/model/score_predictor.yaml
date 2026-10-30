@@ -10,6 +10,7 @@ name: 'None'
 location_target_score_delta: 1
 lr: 0.0000316 #0.0000316
 swivels: 17  # 'all', 'ConfidNet'19
+hook_placement: 'pre'  # 'pre' = swivel INPUT (pre-InstanceNorm, default), 'post' = swivel OUTPUT (post-norm)
 patience: 20
 loss_fn: 'dice'
 perturbations: 'predictor'  # 'none', 'predictor', 'model', 'both'

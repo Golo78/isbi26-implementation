@@ -11,6 +11,51 @@
 #   sites [0,17,-1]-> d_mu +0.071, d_Dice +0.056   (peaks at step ~40, then collapses)
 adapt_sites: [0, 17]
 
+# --- experiment switches (defaults reproduce the original mu-hat ascent) ---------------
+# objective: what the ascent maximizes.
+#   mu           -> predicted score mu-hat.  Label-free, deployable.
+#   oracle-dice  -> the TRUE soft Dice (needs ground-truth labels!).  NOT deployable; it
+#                   is the upper bound of what latent adaptation could reach with a
+#                   perfect quality estimate, and the gap to `mu` is the price paid for
+#                   the imperfect mu-hat / true-Dice correlation.
+objective: mu
+
+# placement: where the affine is applied relative to the swivel's InstanceNorm.
+#   post -> on the norm OUTPUT (default; the affine survives and moves the segmentation)
+#   pre  -> on the norm INPUT, prepended before the score-predictor's recording hook.
+#           The QC head sees the adapted features, but the segmentation path sees
+#           IN(gamma*x + beta) == IN(x), i.e. the affine annihilated.  Expected signature:
+#           mu-hat moves while `logit drift` stays ~0.
+placement: post
+
+# kappa: simultaneous gradient DESCENT on the head's predictive uncertainty, added to the
+# same objective (0 disables, i.e. score ascent only).
+#   sigma      -> objective - kappa_weight * sqrt(mu(1-mu)/(kappa+1))
+#   log-kappa  -> objective + kappa_weight * log(kappa)
+kappa_weight: 0.0
+kappa_objective: sigma
+
+# adapt_logits: additional per-channel affine on the UNet LOGITS (after the last layer),
+# seen by both the segmentation and the QC head.  Combined with adapt_sites; set
+# adapt_sites: [] for logits only.  For a 1-channel network this is, on the hard mask, a
+# per-image threshold shift (-beta/gamma) -- compare with the threshold oracle below.
+# logit_lr: separate Adam lr for the logit affine (null = lr).
+adapt_logits: false
+logit_lr: null
+
+# threshold oracle (always computed, needs labels): per image, the logit threshold t from
+# linspace(min, max, num) (plus 0) that maximizes the true hard Dice of `logits > t`.
+# Step 0.1; +-8 was too narrow (optima hit the grid edge on 3T->1.5T).  Costs one Dice
+# evaluation per candidate (~20 ms per batch of 8, i.e. ~6 s per batch at num=321).
+threshold_oracle:
+  min: -16.0
+  max: 16.0
+  num: 321
+
+# qualitative examples per domain (evenly spaced over the domain) + plots/<...>.png
+n_examples: 6
+plot: true
+
 # optimizer for the latent parameters
 lr: 0.01
 max_steps: 1000  #20 # 100
