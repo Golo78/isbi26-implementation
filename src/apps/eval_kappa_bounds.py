@@ -92,6 +92,23 @@ def main(cfg):
         )
     print(f"[info] score predictor: {os.path.basename(str(sp_ckpt))}")
 
+    # same as eval_latent_tta.py: the checkpoint's hook_placement (pre/post-norm) is
+    # authoritative, the wrong one loads fine but feeds the head the wrong features.
+    ckpt_meta = (
+        torch.load(str(sp_ckpt), map_location="cpu", weights_only=False)
+        .get("hyper_parameters", {})
+        .get("metadata")
+        or {}
+    )
+    ckpt_placement = ckpt_meta.get("hook_placement", "pre")
+    if str(getattr(cfg.model, "hook_placement", "pre")) != ckpt_placement:
+        print(
+            f"[warn] model.hook_placement={cfg.model.hook_placement!r} overridden by "
+            f"checkpoint metadata: {ckpt_placement!r}"
+        )
+    cfg.model.hook_placement = ckpt_placement
+    print(f"[info] score predictor hook_placement: {ckpt_placement}")
+
     model = get_score_prediction_module(
         data_cfg=cfg.data,
         model_cfg=cfg.model,
