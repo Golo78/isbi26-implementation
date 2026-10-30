@@ -6,7 +6,7 @@ TODO.md
 **/pre-trained
 **/lightning_logs
 **/outputs
-**/results
+/results
 **/notebooks/testing
 
 # Byte-compiled / optimized / DLL files
@@ -88,6 +88,9 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+
+# backup copies
+*.bak*
 
 # IPython
 profile_default/
