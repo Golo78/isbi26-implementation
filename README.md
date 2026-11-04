@@ -73,8 +73,28 @@ Thin wrappers around `eval_latent_tta.sh` that fix the switches and the result d
    binary PMRI network this is a per-image threshold shift, compared against the threshold
    oracle that every run computes.
 
+5. **Size oracle** — [src/apps/exp5_size_oracle.sh](src/apps/exp5_size_oracle.sh)
+   (`++tta.size_weight=...`, `++tta.size_noise=...`). Ascent on mu-hat plus a simultaneous
+   descent on the log-size error of the soft mask against G_hat = |P_0| − FP_0 + FN_0, taken
+   once per image from the *true* FP / FN counts of the un-adapted mask. Uses labels, so it
+   is not deployable; it tests whether FP/FN information *in addition to* mu-hat would
+   help. `size_noise` multiplies FP_0 and FN_0 by (1 + U(−n, n)): how accurate a FP/FN head
+   would have to be.
+
+6. **FP/FN oracle** — [src/apps/exp6_fpfn_oracle.sh](src/apps/exp6_fpfn_oracle.sh)
+   (`++tta.fpfn_weight=...`). Ascent on mu-hat plus a simultaneous descent on
+   log(1 + FP) + log(1 + FN) of the *current* soft mask, recomputed from the labels at every
+   step (anchor 0). Simulates a head that predicts FP and FN perfectly for every adapted
+   mask; compared with the size oracle it separates knowing FP/FN once from knowing them
+   at every step (the gradient of FP / FN carries *where* to change). This *separate* form
+   is a log-product and already minimal when FP = 0 or FN = 0; in practice it removes almost
+   all FP and lets FN grow (worse than mu-hat alone). `FPFN_FORM=joint`
+   (`++tta.fpfn_form=joint`) descends log(1 + FP + FN) instead. `FPFN_FN_WEIGHT=a`
+   (`++tta.fpfn_fn_weight=a`) weights FN inside the term, log(1 + FP + a * FN).
+
 Every TTA run prints and stores the credible bounds before and after adaptation, so the
-kappa view is available in all experiments.
+kappa view is available in all experiments, as well as the hard FP / FN counts and mask
+sizes before and after adaptation (over- vs. under-segmentation).
 
 ### Batch runs
 The 100-step comparison over all PMRI splits and predictors `cleanHalf_0..4`:
@@ -82,6 +102,10 @@ The 100-step comparison over all PMRI splits and predictors `cleanHalf_0..4`:
   (pre-/post-norm score predictor x with/without logit affine), one GPU, sequential.
 - [src/apps/run_oracle_queue.sh](src/apps/run_oracle_queue.sh) — oracle runs (sites, sites +
   logits), distributed round-robin over several GPUs.
+- [src/apps/run_size_oracle_queue.sh](src/apps/run_size_oracle_queue.sh) — size oracle
+  (weights x noise levels x predictors), same round-robin scheme.
+- [src/apps/run_fpfn_oracle_queue.sh](src/apps/run_fpfn_oracle_queue.sh) — FP/FN oracle
+  (weights x predictors), same round-robin scheme.
 
 Logs go to `logs/`.
 
@@ -97,6 +121,10 @@ Logs go to `logs/`.
 | `latent_tta_prenorm_adapter` | pre-norm | sites, affine pre-norm | mu-hat | `exp2_prenorm_adapter.sh` |
 | `kappa_bounds` | pre-norm | — | — | `exp3_kappa_bounds.sh` |
 | `latent_tta_kappa_<obj>_w<weight>` | pre-norm | sites | mu-hat + uncertainty | `exp3_kappa_descent.sh` |
+| `latent_tta_mu_size_w<weight>[_noise<n>]` | pre-norm | sites | mu-hat + size from true FP/FN | `exp5_size_oracle.sh`, `run_size_oracle_queue.sh` |
+| `latent_tta_mu_fpfn_w<weight>` | pre-norm | sites | mu-hat + true log(1+FP) + log(1+FN) at every step | `exp6_fpfn_oracle.sh`, `run_fpfn_oracle_queue.sh` |
+| `latent_tta_mu_fpfn_joint_w<weight>` | pre-norm | sites | mu-hat + true log(1+FP+FN) at every step | `FPFN_FORM=joint` with the same scripts |
+| `latent_tta_mu_fpfn_joint_fn<a>_w<weight>` | pre-norm | sites | mu-hat + true log(1+FP+a*FN) at every step | `FPFN_FORM=joint FPFN_FN_WEIGHT=a` |
 
 ## Analysis notebooks
 QC analysis workflow is in [src/notebooks/QC_eval.ipynb](src/notebooks/QC_eval.ipynb). It:
