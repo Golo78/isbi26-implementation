@@ -20,6 +20,22 @@ independent of each other -- run one at a time):
 
   ++tta.adapt_logits=true       Add a per-channel affine on the UNet logits (in addition to
                                 `adapt_sites`; `++tta.adapt_sites=[]` for logits only).
+  ++tta.size_weight=1.0         SIZE ORACLE: descend the log-size error of the mask against
+                                G_hat = |P_0| - FP_0 + FN_0, computed once per image from
+                                the TRUE FP/FN of the un-adapted mask (labels!), simultaneously
+                                with the ascent.  ++tta.size_noise=0.2 multiplies FP_0 and FN_0
+                                by independent (1 + U(-0.2, 0.2)) factors (a head that
+                                predicts FP/FN only approximately).
+  ++tta.fpfn_weight=1.0         FP/FN ORACLE: descend log(1 + FP) + log(1 + FN) of the CURRENT
+                                soft mask against the labels at every step (anchor 0),
+                                simultaneously with the ascent (a head that predicts FP and
+                                FN perfectly for every adapted mask).
+  ++tta.fpfn_form=joint         descend log(1 + FP + FN) instead (default `separate` above,
+                                which is already minimal when FP = 0 or FN = 0).
+  ++tta.fpfn_fn_weight=3.0      weight a on FN inside the FP/FN term: log(1 + FP + a * FN).
+
+Every run stores the hard FP / FN counts and mask sizes before and after adaptation, so
+over- vs. under-segmentation can be read off for any objective.
 
 Regardless of the switches, the un-adapted predictions are summarised with their Beta
 credible intervals (coverage of the true Dice per nominal level), so the kappa bounds of
@@ -33,6 +49,10 @@ beyond it is more than recalibrating the final decision threshold.  In addition,
 `tta.n_examples` images per domain are snapshotted (image, GT, masks before / at the best
 TTA step / after TTA / at the oracle threshold) and plotted by `plot_latent_tta.py` into
 `<save_dir>/plots/` together with their predicted-vs-actual Dice and kappa trajectories.
+`tta.example_indices` replaces the evenly spaced snapshots by an explicit list of dataset
+indices; with `tta.examples_only` only the test domain is evaluated and only the batches
+containing them are adapted (re-running selected cases of an earlier run; all per-image
+results then cover those batches only).
 The score predictor's `hook_placement` is taken from the checkpoint metadata.
 
 Written as a standalone app rather than a Lightning `predict_step` so that autograd mode,
@@ -72,7 +92,7 @@ from model.latent_adapter import (
     # latent_penalty,
     run_latent_tta,
 )
-from losses import unified_score_loss, soft_dice_from_logits
+from losses import unified_score_loss, soft_dice_from_logits, soft_fp_fn_from_logits, fp_fn_counts
 from model.calibration import interval_report, format_interval_report
 from plot_latent_tta import plot_all
 
@@ -120,6 +140,44 @@ def make_soft_dice_fn(target: torch.Tensor, num_classes: int):
         )
 
     return oracle_fn
+
+
+def make_fpfn_fn(target: torch.Tensor, num_classes: int):
+    """Differentiable true soft FP / FN callback (ORACLE objective / diagnostic)."""
+
+    def fpfn_fn(logits: torch.Tensor):
+        return soft_fp_fn_from_logits(logits, target, num_classes)
+
+    return fpfn_fn
+
+
+@torch.no_grad()
+def make_size_target(
+    logits0: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    noise: float = 0.0,
+    generator: torch.Generator = None,
+) -> Dict[str, torch.Tensor]:
+    """ORACLE size target from the true FP / FN counts of the UN-adapted mask.
+
+    G_hat = |P_0| - FP_0 * (1 + e_fp) + FN_0 * (1 + e_fn), per image and foreground class,
+    with e ~ U(-noise, noise) drawn independently for FP and FN (noise = 0: G_hat = |G|).
+    It needs labels and only simulates a head that predicts FP / FN once before the
+    adaptation; the target is fixed for the whole run.
+
+    Returns [B, C-1] tensors (cpu except `target`): target (on the logits' device),
+    fp, fn, pred_size, gt_size and eps [B, C-1, 2] (fp, fn).
+    """
+    fp, fn, p_size, g_size = fp_fn_counts(hard_labels(logits0), target, num_classes)
+    # drawn on the cpu with a seeded generator, so the noise does not depend on the GPU
+    eps = (torch.rand(*fp.shape, 2, generator=generator) * 2 - 1) * float(noise)
+    fp, fn, p_size, g_size = fp.cpu(), fn.cpu(), p_size.cpu(), g_size.cpu()
+    g_hat = (p_size - fp * (1 + eps[..., 0]) + fn * (1 + eps[..., 1])).clamp_min(0)
+    return {
+        "target": g_hat.to(logits0.device),
+        "fp": fp, "fn": fn, "pred_size": p_size, "gt_size": g_size, "eps": eps,
+    }
 
 
 def hard_labels(logits: torch.Tensor) -> torch.Tensor:
@@ -379,11 +437,22 @@ def main(cfg):
     objective = str(getattr(cfg_tta, "objective", "mu"))
     kappa_weight = float(getattr(cfg_tta, "kappa_weight", 0.0))
     kappa_objective = str(getattr(cfg_tta, "kappa_objective", "sigma"))
+    size_weight = float(getattr(cfg_tta, "size_weight", 0.0))
+    size_noise = float(getattr(cfg_tta, "size_noise", 0.0))
+    size_noise_seed = int(getattr(cfg_tta, "size_noise_seed", 0))
+    size_gen = torch.Generator()
+    fpfn_weight = float(getattr(cfg_tta, "fpfn_weight", 0.0))
+    fpfn_form = str(getattr(cfg_tta, "fpfn_form", "separate"))
+    fpfn_fn_weight = float(getattr(cfg_tta, "fpfn_fn_weight", 1.0))
     thr_cfg = getattr(cfg_tta, "threshold_oracle", None) or {}
     thr_shifts = threshold_grid(
         thr_cfg.get("min", -16.0), thr_cfg.get("max", 16.0), thr_cfg.get("num", 321)
     )
     n_examples = int(getattr(cfg_tta, "n_examples", 6))
+    example_indices = getattr(cfg_tta, "example_indices", None)
+    examples_only = bool(getattr(cfg_tta, "examples_only", False))
+    if examples_only and not example_indices:
+        raise ValueError("tta.examples_only needs tta.example_indices")
     max_batches = getattr(cfg, "max_batches", None)
     print(f"[info] adapting sites: {sites} (placement={placement})")
     if adapt_logits:
@@ -391,10 +460,21 @@ def main(cfg):
     print(
         f"[info] objective={objective}"
         + (f" + {kappa_weight} * uncertainty[{kappa_objective}]" if kappa_weight else "")
+        + (f" - {size_weight} * size error (noise {size_noise})" if size_weight else "")
+        + (f" - {fpfn_weight} * "
+           + (f"log(1+FP+{fpfn_fn_weight}*FN)" if fpfn_form == "joint"
+              else f"(log(1+FP) + log(1+{fpfn_fn_weight}*FN))")
+           if fpfn_weight else "")
     )
     if objective == "oracle-dice":
         print("[warn] ORACLE run: the adaptation objective uses ground-truth labels "
               "and is NOT a deployable method -- upper bound only.")
+    if size_weight:
+        print("[warn] SIZE ORACLE run: the size target uses the true FP/FN counts "
+              "(ground-truth labels) -- not a deployable method.")
+    if fpfn_weight:
+        print("[warn] FP/FN ORACLE run: the true FP/FN of every step enter the objective "
+              "(ground-truth labels) -- not a deployable method.")
 
     # ---- evaluate -------------------------------------------------------------------
     results: Dict[str, Dict] = {}
@@ -403,20 +483,27 @@ def main(cfg):
             not getattr(cfg, "include_train", False) and "_train" in domain
         ):  # use only val and test domain
             continue
+        if examples_only and not domain.endswith("_test"):  # indices refer to the test domain
+            continue
         print(f"\n=== domain {domain} (n={len(loader.dataset)}) ===")
 
         n_eval = len(loader.dataset)
         if max_batches is not None:
             n_eval = min(n_eval, int(max_batches) * int(loader.batch_size))
-        example_idx = set(
-            torch.linspace(0, n_eval - 1, min(n_examples, n_eval)).round().long().tolist()
-        ) if n_examples > 0 else set()
+        if example_indices:
+            example_idx = {int(i) for i in example_indices if 0 <= int(i) < n_eval}
+        else:
+            example_idx = set(
+                torch.linspace(0, n_eval - 1, min(n_examples, n_eval)).round().long().tolist()
+            ) if n_examples > 0 else set()
         examples: Dict[str, List[torch.Tensor]] = {
             k: []
             for k in ("index", "image", "target", "pred_before", "pred_best",
                       "pred_final", "pred_threshold")
         }
         thr_dice, thr_shift, thr_scores = [], [], []
+        # same noise draws for every predictor / run: reseed per domain
+        size_gen.manual_seed(size_noise_seed)
         logit_log_gamma, logit_beta = [], []
         offset = 0
 
@@ -432,16 +519,32 @@ def main(cfg):
                 "sigma_before",
                 "sigma_after",
                 "logit_drift",
+                # per image, summed over foreground classes; hard masks vs. labels
+                "fp_before",
+                "fn_before",
+                "fp_after",
+                "fn_after",
+                "size_gt",
+                "size_before",
+                "size_after",
+                "size_target",
             )
         }
+        size_eps = []
         traces, steps_taken = [], []
         # per-image trajectories: one [B, S] matrix per batch, concatenated below
         dice_steps, mu_steps = [], []
         kappa_steps, sigma_steps, soft_dice_steps, drift_steps = [], [], [], []
+        soft_size_steps, hard_size_steps, size_loss_steps = [], [], []
+        fp_soft_steps, fn_soft_steps = [], []
 
         for batch_idx, batch in enumerate(tqdm(loader, desc=domain)):
             if max_batches is not None and batch_idx >= int(max_batches):
                 break
+            B = batch["input"].size(0)
+            if examples_only and not any(offset <= i < offset + B for i in example_idx):
+                offset += B
+                continue
             x = batch["input"].to(device).float()
             t = batch["target"].to(device).long()
             t[t == -1] = 0
@@ -461,6 +564,14 @@ def main(cfg):
             rows["mu_before"].append(mu0)
             rows["kappa_before"].append(kappa0)
             rows["sigma_before"].append((mu0 * (1 - mu0) / (kappa0 + 1)).sqrt())
+            # size ORACLE target (labels); computed in every run, used only if size_weight > 0
+            size = make_size_target(logits0, t, num_classes, size_noise, size_gen)
+            rows["fp_before"].append(size["fp"].sum(1))
+            rows["fn_before"].append(size["fn"].sum(1))
+            rows["size_gt"].append(size["gt_size"].sum(1))
+            rows["size_before"].append(size["pred_size"].sum(1))
+            rows["size_target"].append(size["target"].sum(1).cpu())
+            size_eps.append(size["eps"])
 
             # ORACLE: best Dice by moving only the final threshold of the UN-adapted logits
             thr = threshold_oracle(logits0, score_fn, thr_shifts)
@@ -487,6 +598,12 @@ def main(cfg):
                 oracle_fn=oracle_fn,
                 kappa_weight=kappa_weight,
                 kappa_objective=kappa_objective,
+                size_weight=size_weight,
+                size_target=size["target"],
+                fpfn_weight=fpfn_weight,
+                fpfn_fn=make_fpfn_fn(t, num_classes),
+                fpfn_form=fpfn_form,
+                fpfn_fn_weight=fpfn_fn_weight,
                 logit_lr=logit_lr,
             )
             B = x.size(0)
@@ -516,6 +633,11 @@ def main(cfg):
             drift_steps.append(out["per_step"]["logit_drift"])
             if "soft_dice" in out["per_step"]:
                 soft_dice_steps.append(out["per_step"]["soft_dice"])
+            soft_size_steps.append(out["per_step"]["soft_size"])
+            hard_size_steps.append(out["per_step"]["hard_size"])
+            size_loss_steps.append(out["per_step"]["size_loss"])
+            fp_soft_steps.append(out["per_step"]["fp_soft"])
+            fn_soft_steps.append(out["per_step"]["fn_soft"])
 
             mu1 = out["prediction"][:, 0, 0].cpu()
             kappa1 = out["prediction"][:, 0, 1].cpu()
@@ -524,6 +646,10 @@ def main(cfg):
             rows["kappa_after"].append(kappa1)
             rows["sigma_after"].append((mu1 * (1 - mu1) / (kappa1 + 1)).sqrt())
             rows["logit_drift"].append(out["per_step"]["logit_drift"][:, -1])
+            fp1, fn1, p1, _ = fp_fn_counts(hard_labels(out["logits"]), t, num_classes)
+            rows["fp_after"].append(fp1.sum(1).cpu())
+            rows["fn_after"].append(fn1.sum(1).cpu())
+            rows["size_after"].append(p1.sum(1).cpu())
 
         cat = {k: torch.cat(v) for k, v in rows.items()}
         d_before, d_after = (
@@ -543,6 +669,19 @@ def main(cfg):
         print(f'  logit drift (mean |logits - logits_0|): {cat["logit_drift"].mean():.6f}')
         if steps_taken:
             print(f"  steps mean {sum(steps_taken)/len(steps_taken):.1f}")
+        # over- vs. under-segmentation (hard masks, labels): mean pixels per image
+        print(
+            f'  FP {cat["fp_before"].mean():.0f} -> {cat["fp_after"].mean():.0f}'
+            f'   FN {cat["fn_before"].mean():.0f} -> {cat["fn_after"].mean():.0f}'
+            f'   |P| {cat["size_before"].mean():.0f} -> {cat["size_after"].mean():.0f}'
+            f'   (|G| {cat["size_gt"].mean():.0f})'
+        )
+        if size_weight:
+            rel = lambda s: ((s - cat["size_target"]).abs() / cat["size_target"].clamp_min(1)).median()
+            print(
+                f'  size target G_hat {cat["size_target"].mean():.0f}; median |P - G_hat| / G_hat '
+                f'{rel(cat["size_before"]):.3f} -> {rel(cat["size_after"]):.3f}'
+            )
 
         # kappa credible bounds of the CURRENT (un-adapted) predictions, and after TTA
         bounds_before = interval_report(
@@ -563,6 +702,11 @@ def main(cfg):
         soft_dice_per_step = (
             concat_per_step(soft_dice_steps) if soft_dice_steps else torch.empty(0)
         )
+        soft_size_per_step = concat_per_step(soft_size_steps)
+        hard_size_per_step = concat_per_step(hard_size_steps)
+        size_loss_per_step = concat_per_step(size_loss_steps)
+        fp_soft_per_step = concat_per_step(fp_soft_steps)
+        fn_soft_per_step = concat_per_step(fn_soft_steps)
         assert dice_per_step.shape[0] == cat["dice_before"].numel(), (
             f"per-step matrix has {dice_per_step.shape[0]} rows but "
             f"{cat['dice_before'].numel()} images were evaluated"
@@ -629,6 +773,12 @@ def main(cfg):
             "sigma_per_step": sigma_per_step,
             "logit_drift_per_step": drift_per_step,
             "soft_dice_per_step": soft_dice_per_step,
+            "soft_size_per_step": soft_size_per_step,    # [N, S] sum(p) over fg classes
+            "hard_size_per_step": hard_size_per_step,    # [N, S] fg pixel count
+            "size_loss_per_step": size_loss_per_step,    # [N, S] log-size error vs. G_hat
+            "fp_soft_per_step": fp_soft_per_step,        # [N, S] true soft FP, sum over fg classes
+            "fn_soft_per_step": fn_soft_per_step,        # [N, S] true soft FN
+            "size_eps": torch.cat(size_eps),             # [N, C-1, 2] noise (fp, fn)
             "best_step": best_step,
             "best_dice": best_dice,
             "traces": traces,
@@ -638,6 +788,12 @@ def main(cfg):
             "placement": placement,
             "kappa_weight": kappa_weight,
             "kappa_objective": kappa_objective,
+            "size_weight": size_weight,
+            "size_noise": size_noise,
+            "size_noise_seed": size_noise_seed,
+            "fpfn_weight": fpfn_weight,
+            "fpfn_form": fpfn_form,
+            "fpfn_fn_weight": fpfn_fn_weight,
             "bounds_before": bounds_before,
             "bounds_after": bounds_after,
             # threshold oracle on the un-adapted logits (labels!)
@@ -684,7 +840,9 @@ def main(cfg):
         pkl.dump(packaged, f)
     print(f"\nSaved to {out_path}")
 
-    if bool(getattr(cfg_tta, "plot", True)):
+    # the per-image rows of an examples_only run cover the selected batches only, so the
+    # dataset indices of the snapshots do not address them
+    if bool(getattr(cfg_tta, "plot", True)) and not examples_only:
         paths = plot_all(packaged, os.path.join(save_dir, "plots"))
         print(f"Wrote {len(paths)} plots to {os.path.join(save_dir, 'plots')}")
 

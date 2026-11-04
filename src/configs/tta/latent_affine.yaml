@@ -35,6 +35,27 @@ placement: post
 kappa_weight: 0.0
 kappa_objective: sigma
 
+# size ORACLE: simultaneous descent on the error of the soft mask size against a target
+# fixed before the adaptation (0 disables).  The target uses the TRUE FP/FN counts of the
+# un-adapted mask (labels!), i.e. it simulates a head that predicts FP and FN once:
+#   G_hat     = |P_0| - FP_0 * (1 + e_fp) + FN_0 * (1 + e_fn),   e ~ U(-size_noise, size_noise)
+#   objective - size_weight * (log(1 + sum p) - log(1 + G_hat))^2
+# size_noise = 0 -> G_hat is the true GT size.  size_noise_seed fixes the draws (per domain).
+size_weight: 0.0
+size_noise: 0.0
+size_noise_seed: 0
+
+# FP/FN ORACLE: simultaneous descent on the TRUE soft FP and FN counts of the CURRENT mask,
+# recomputed at every step (labels!), anchored at 0 (0 disables):
+#   objective - fpfn_weight * (log(1 + FP) + log(1 + FN)),  FP = sum p(1-g), FN = sum (1-p)g
+# simulates a head that predicts FP and FN perfectly for every mask the adaptation produces.
+fpfn_weight: 0.0
+# separate: log(1 + FP) + log(1 + FN) (minimal as soon as FP = 0 OR FN = 0)
+# joint:    log(1 + FP + FN)          (minimal only for a perfect mask)
+fpfn_form: separate
+# weight a on FN inside either form, e.g. log(1 + FP + a * FN) (> 1: missing pixels cost more)
+fpfn_fn_weight: 1.0
+
 # adapt_logits: additional per-channel affine on the UNet LOGITS (after the last layer),
 # seen by both the segmentation and the QC head.  Combined with adapt_sites; set
 # adapt_sites: [] for logits only.  For a 1-channel network this is, on the hard mask, a
@@ -54,6 +75,10 @@ threshold_oracle:
 
 # qualitative examples per domain (evenly spaced over the domain) + plots/<...>.png
 n_examples: 6
+# explicit dataset indices to snapshot instead (null = evenly spaced); examples_only: adapt
+# only the batches that contain them (re-running selected cases, e.g. failures)
+example_indices: null
+examples_only: false
 plot: true
 
 # optimizer for the latent parameters

@@ -125,6 +125,88 @@ def soft_dice_from_logits(
     return dice.mean(1) if include_background else dice[:, 1:].mean(1)
 
 
+def soft_size_from_logits(logits: Tensor) -> Tensor:
+    """Differentiable per-sample foreground size (expected pixel count) per class.
+
+    The hard size (number of pixels with `logits > 0` / argmax == c) has zero gradient
+    almost everywhere; this soft relaxation sums the predicted class probabilities
+    instead.  It needs no labels, so it can enter a deployable objective; in the
+    size-anchored latent TTA (`run_latent_tta`, `size_weight > 0`) it is matched to a
+    target size that is fixed before the adaptation.
+
+    Args:
+        logits: [B, 1, H, W] (binary, sigmoid) or [B, C, H, W] (softmax).
+
+    Returns:
+        Tensor: [B, C-1] soft size per foreground class ([B, 1] for binary).
+    """
+    if logits.shape[1] == 1:
+        probs = sigmoid(logits)                     # [B, 1, H, W]
+    else:
+        probs = torch.softmax(logits, dim=1)[:, 1:] # [B, C-1, H, W]
+    return probs.flatten(2).sum(-1)
+
+
+def soft_fp_fn_from_logits(
+    logits: Tensor,
+    target_segmentation: Tensor,
+    num_classes: int = 4,
+) -> tuple:
+    """Differentiable per-sample false-positive / false-negative counts per foreground class.
+
+    Soft relaxation of `fp_fn_counts`: FP = sum p (1 - g), FN = sum (1 - p) g with the
+    predicted class probabilities p.  Needs the ground truth g, so it is an ORACLE
+    objective (`run_latent_tta`, `fpfn_weight > 0`).  Although the values are two numbers
+    per class, their gradient w.r.t. p is the label map itself ((1 - g) resp. -g), i.e. it
+    tells every pixel which way to move.
+
+    Args:
+        logits:              [B, 1, H, W] (binary, sigmoid) or [B, C, H, W] (softmax).
+        target_segmentation: [B, 1, H, W] or [B, H, W] integer labels.
+        num_classes:         number of classes including background.
+
+    Returns:
+        (fp, fn): each [B, C-1].
+    """
+    if logits.shape[1] == 1:
+        probs = sigmoid(logits)                     # [B, 1, H, W]
+    else:
+        probs = torch.softmax(logits, dim=1)[:, 1:] # [B, C-1, H, W]
+    tgt = target_segmentation.reshape(logits.shape[0], -1).long().clamp_min(0)
+    onehot = torch.stack([tgt == c for c in range(1, num_classes)], dim=1).to(probs)  # [B, C-1, HW]
+    probs = probs.flatten(2)
+    fp = (probs * (1 - onehot)).sum(-1)
+    fn = ((1 - probs) * onehot).sum(-1)
+    return fp, fn
+
+
+def fp_fn_counts(
+    predicted_segmentation: Tensor,
+    target_segmentation: Tensor,
+    num_classes: int = 4,
+) -> tuple:
+    """Hard false-positive / false-negative pixel counts per sample and foreground class.
+
+    Args:
+        predicted_segmentation: [B, 1, H, W] or [B, H, W] integer labels.
+        target_segmentation:    [B, 1, H, W] or [B, H, W] integer labels.
+        num_classes:            number of classes including background.
+
+    Returns:
+        (fp, fn, pred_size, target_size): each [B, C-1], float.
+    """
+    pred = predicted_segmentation.reshape(predicted_segmentation.shape[0], -1).long()
+    tgt = target_segmentation.reshape(target_segmentation.shape[0], -1).long().clamp_min(0)
+    fp, fn, p_size, t_size = [], [], [], []
+    for c in range(1, num_classes):
+        p, t = pred == c, tgt == c
+        fp.append((p & ~t).sum(1))
+        fn.append((~p & t).sum(1))
+        p_size.append(p.sum(1))
+        t_size.append(t.sum(1))
+    return tuple(torch.stack(v, dim=1).float() for v in (fp, fn, p_size, t_size))
+
+
 def hausdorff_loss(
     predicted_segmentation: Tensor, 
     target_segmentation: Tensor,

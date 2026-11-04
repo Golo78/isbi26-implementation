@@ -41,6 +41,21 @@ Objectives (`run_latent_tta`)
 Independently of the objective, `kappa_weight > 0` adds a simultaneous descent on the
 predictive uncertainty of the QC head (Beta sigma, or -log kappa).
 
+`size_weight > 0` adds a simultaneous descent on the error of the soft foreground size
+against a per-image target size `size_target` that is fixed BEFORE the adaptation (in
+`apps/eval_latent_tta.py`: G_hat = |P_0| - FP_0 + FN_0 from the true FP/FN counts of the
+un-adapted mask, optionally noised -- an oracle for a head that predicts FP and FN).
+The term carries no location information: mu-hat decides *where* the mask changes, the
+size term *how much*.
+
+`fpfn_weight > 0` instead descends the TRUE soft FP and FN counts of the current mask at
+every step, anchored at 0 (`fpfn_fn`, labels) -- an oracle for a head that predicts FP and
+FN perfectly for every mask the adaptation produces.  `fpfn_form='separate'` descends
+log(1 + FP) + log(1 + FN) = log((1 + FP)(1 + FN)), whose minimum is reached as soon as ONE of
+the two counts is 0 (e.g. an under-segmenting mask with FP = 0); `fpfn_form='joint'`
+descends log(1 + FP + FN), which only vanishes for a perfect mask.  `fpfn_fn_weight` scales
+FN inside either form (> 1: a missing foreground pixel costs more than a wrong one).
+
 Logit adapter (`adapt_logits=True`)
 -----------------------------------
 Adds one more per-sample, per-channel affine directly on the UNet OUTPUT, registered as a
@@ -65,6 +80,7 @@ from torch import Tensor, nn
 import sys
 sys.path.append('../')
 from utils import find_shapes_for_swivels
+from losses import soft_size_from_logits
 
 
 # --------------------------------------------------------------------------------------
@@ -408,6 +424,12 @@ def run_latent_tta(
     oracle_fn: Optional[Callable[[Tensor], Tensor]] = None,
     kappa_weight: float = 0.0,
     kappa_objective: str = 'sigma',
+    size_weight: float = 0.0,
+    size_target: Optional[Tensor] = None,
+    fpfn_weight: float = 0.0,
+    fpfn_fn: Optional[Callable[[Tensor], Tuple[Tensor, Tensor]]] = None,
+    fpfn_form: str = 'separate',
+    fpfn_fn_weight: float = 1.0,
     logit_lr: Optional[float] = None,
 ) -> Dict:
     """Adapt the latent features of `x` by gradient ascent, then return the result.
@@ -433,6 +455,27 @@ def run_latent_tta(
         kappa_objective='sigma'      : objective - w * sigma,      sigma = sqrt(mu(1-mu)/(kappa+1))
         kappa_objective='log-kappa'  : objective + w * log(kappa)
 
+    `size_weight > 0` additionally descends the error of the soft foreground size
+    S = sum(p) against `size_target` [B, C-1] (fixed for the whole run, per foreground
+    class), measured in log space so that it is relative and defined for empty masks:
+
+        objective - w * mean_c (log(1 + S_c) - log(1 + size_target_c))^2
+
+    `fpfn_weight > 0` additionally descends the soft false-positive and false-negative
+    counts of the CURRENT mask, recomputed at every step by `fpfn_fn(logits) -> (fp, fn)`
+    [B, C-1] (needs labels: ORACLE), anchored at 0 in log space:
+
+        fpfn_form='separate' : objective - w * mean_c (log(1 + FP_c) + log(1 + a * FN_c))
+        fpfn_form='joint'    : objective - w * mean_c log(1 + FP_c + a * FN_c)
+
+    with a = `fpfn_fn_weight` (default 1).
+
+    The separate form is a log-product and is already minimal when either count is 0, so
+    it can trade all FP for more FN; the joint form penalises every wrong pixel equally.
+
+    `fpfn_fn` is also evaluated without weight, for reporting only (per_step['fp_soft'],
+    per_step['fn_soft']).
+
     `score_fn(logits) -> [B]` is a *diagnostic* callback for the true (hard) score.  It is
     used for reporting only and must never touch the objective -- with objective='mu' the
     ground truth must not leak into the adaptation.
@@ -446,6 +489,9 @@ def run_latent_tta(
         per_step['true_score'] : [B, S]   true hard score after k steps (only if score_fn)
         per_step['soft_dice']  : [B, S]   true soft Dice after k steps (only if oracle_fn)
         per_step['logit_drift']: [B, S]   mean |logits - logits_0|, 0 at step 0
+        per_step['soft_size']  : [B, S]   soft foreground size sum(p), summed over classes
+        per_step['hard_size']  : [B, S]   hard foreground pixel count, summed over classes
+        per_step['size_loss']  : [B, S]   log-size error vs. size_target (only if given)
 
     where S = steps_taken + 1 and column 0 is the un-adapted reference.  The `trace`
     entries are batch means of these, kept scalar because `should_stop` compares them.
@@ -472,6 +518,13 @@ def run_latent_tta(
     kappa_objective = str(kappa_objective).lower()
     if kappa_weight and kappa_objective not in ('sigma', 'log-kappa'):
         raise ValueError(f"unknown kappa_objective {kappa_objective!r}")
+    if size_weight and size_target is None:
+        raise ValueError("size_weight > 0 requires a `size_target` [B, C-1]")
+    if fpfn_weight and fpfn_fn is None:
+        raise ValueError("fpfn_weight > 0 requires an `fpfn_fn`")
+    fpfn_form = str(fpfn_form).lower()
+    if fpfn_form not in ('separate', 'joint'):
+        raise ValueError(f"unknown fpfn_form {fpfn_form!r}")
 
     if reset:
         reset_adapters(adapters)
@@ -493,6 +546,11 @@ def run_latent_tta(
     score_steps: List[Tensor] = []
     soft_steps: List[Tensor] = []
     drift_steps: List[Tensor] = []
+    soft_size_steps: List[Tensor] = []
+    hard_size_steps: List[Tensor] = []
+    size_loss_steps: List[Tensor] = []
+    fp_steps: List[Tensor] = []
+    fn_steps: List[Tensor] = []
     logits = None
     prediction = None
     logits0 = None
@@ -510,6 +568,19 @@ def run_latent_tta(
             # differentiable true Dice -- only entering the objective when objective='oracle-dice',
             # otherwise computed for reporting only (and detached below).
             soft_dice = oracle_fn(logits) if oracle_fn is not None else None
+            soft_size = soft_size_from_logits(logits)       # [B, C-1], label-free
+            size_loss = (
+                (torch.log1p(soft_size) - torch.log1p(size_target.to(soft_size))).pow(2).mean(1)
+                if size_target is not None else None
+            )
+            # true soft FP / FN of the current mask (labels) -- objective only if fpfn_weight > 0
+            fp_soft, fn_soft = fpfn_fn(logits) if fpfn_fn is not None else (None, None)
+            if fp_soft is None:
+                fpfn_loss = None
+            elif fpfn_form == 'joint':
+                fpfn_loss = torch.log1p(fp_soft + fpfn_fn_weight * fn_soft).mean(1)
+            else:
+                fpfn_loss = (torch.log1p(fp_soft) + torch.log1p(fpfn_fn_weight * fn_soft)).mean(1)
 
         with torch.no_grad():
             if logits0 is None:
@@ -529,6 +600,14 @@ def run_latent_tta(
             kappa_steps.append(kappa.detach().cpu())
             sigma_steps.append(sigma.detach().cpu())
             drift_steps.append(drift)
+            soft_size_steps.append(soft_size.sum(1).detach().cpu())
+            hard_size_steps.append(fg.flatten(1).sum(1).float().cpu())
+            if size_loss is not None:
+                size_loss_steps.append(size_loss.detach().cpu())
+                rec['size_loss'] = float(size_loss.mean().item())
+            if fp_soft is not None:
+                fp_steps.append(fp_soft.sum(1).detach().cpu())
+                fn_steps.append(fn_soft.sum(1).detach().cpu())
             if soft_dice is not None:
                 sd = soft_dice.detach().cpu()
                 soft_steps.append(sd)
@@ -566,6 +645,14 @@ def run_latent_tta(
             else:  # 'log-kappa'
                 obj = obj + kappa_weight * torch.log(kappa).mean()
 
+        # simultaneous descent on the size error vs. the fixed target (size_weight = 0 disables)
+        if size_weight:
+            obj = obj - size_weight * size_loss.mean()
+
+        # simultaneous descent on the true soft FP / FN, anchored at 0 (fpfn_weight = 0 disables)
+        if fpfn_weight:
+            obj = obj - fpfn_weight * fpfn_loss.mean()
+
         # currently not in use, but could be re-enabled if we want to keep the adapted parameters close to the identity
         # if prox_weight > 0:
         #     obj = obj - prox_weight * latent_penalty(adapters)
@@ -588,7 +675,14 @@ def run_latent_tta(
         'kappa': torch.stack(kappa_steps, dim=1),
         'sigma': torch.stack(sigma_steps, dim=1),
         'logit_drift': torch.stack(drift_steps, dim=1),
+        'soft_size': torch.stack(soft_size_steps, dim=1),
+        'hard_size': torch.stack(hard_size_steps, dim=1),
     }
+    if size_loss_steps:
+        per_step['size_loss'] = torch.stack(size_loss_steps, dim=1)
+    if fp_steps:
+        per_step['fp_soft'] = torch.stack(fp_steps, dim=1)
+        per_step['fn_soft'] = torch.stack(fn_steps, dim=1)
     if score_steps:
         per_step['true_score'] = torch.stack(score_steps, dim=1)
     if soft_steps:
@@ -602,5 +696,9 @@ def run_latent_tta(
         'per_step': per_step,
         'objective': objective,
         'kappa_weight': float(kappa_weight),
+        'size_weight': float(size_weight),
+        'fpfn_weight': float(fpfn_weight),
+        'fpfn_form': fpfn_form,
+        'fpfn_fn_weight': float(fpfn_fn_weight),
         'best_pred': best_pred,
     }
