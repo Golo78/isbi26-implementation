@@ -1,0 +1,31 @@
+# FP/FN head (model/fpfn_head.py): predicts (log(1+FP), log(1+FN)) of the U-Net's soft mask
+# per foreground class.  Same architecture, swivels and hook placement as the score
+# (mu-hat) predictor it is paired with in the latent TTA -- keep them in sync.
+name: 'None'
+num_classes: 2
+swivels: 'first-embedding-last'
+hook_placement: 'pre'          # must match the score predictor (pre_norm_with_logits: pre)
+
+lr: 0.0000316
+patience: 20
+regression_loss: mse           # mse | huber, on log(1 + count)
+# what is counted: hard -> pixels of the thresholded mask (logits > 0), like the hard Dice of
+# the score predictor; soft -> sum p(1-g), sum (1-p)g (the quantities of the FP/FN oracle)
+count_target: hard
+
+# adversarial training, analogous to the location adversary of the score predictor
+perturbations: predictor       # none | predictor
+adversarial_skip_epochs: 40    # clean training only
+adversarial_warmup_epochs: 30  # linear ramp of the step-size target
+adv_target_dice_drop: 0.1      # target drop of the TRUE hard Dice per adversarial step (as the score predictor)
+adv_controller_gain: 0.1
+adv_fn_weight: 1.0             # a in the adversarial direction log(1 + FP_hat + a * FN_hat)
+# second adversary in the TTA direction: steps that LOWER the predicted error, trained on with
+# their true counts; step size controlled on the predicted log(1 + FP_hat + a * FN_hat) drop
+adv_down: false
+adv_down_target_log_drop: 0.5
+
+# only used for the checkpoint file name (get_score_prediction_module_trainer)
+loss_fn: fpfn
+predictor_parameter: location
+likelihood: mse
