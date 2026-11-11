@@ -24,6 +24,9 @@ set -euo pipefail
 #   FPFN_WEIGHT     weight of the simultaneous descent on the true FP/FN (0 = off; ORACLE, uses labels)
 #   FPFN_FORM       separate (log(1+FP) + log(1+FN), default) | joint (log(1+FP+FN))
 #   FPFN_FN_WEIGHT  weight of FN inside the FP/FN term (default 1.0)
+#   FPFN_SOURCE     oracle (true FP/FN, labels; default) | head (trained FP/FN head, label-free)
+#   FPFN_HEAD_NAME  FP/FN head checkpoint name (default null: fpfn_<k> for CKPT_NAME cleanHalf_<k>)
+#   FPFN_HEAD_DIR   folder of the FP/FN heads (default pre-trained/fpfn-heads)
 #   ADAPT_LOGITS    True | False       (additional affine on the UNet logits)
 #   LOGIT_LR        Adam lr of the logit affine (default: null = same lr)
 #   N_EXAMPLES      images per domain snapshotted + plotted (default 6)
@@ -53,6 +56,9 @@ SIZE_NOISE_SEED=${SIZE_NOISE_SEED:-0}
 FPFN_WEIGHT=${FPFN_WEIGHT:-0.0}
 FPFN_FORM=${FPFN_FORM:-separate}
 FPFN_FN_WEIGHT=${FPFN_FN_WEIGHT:-1.0}
+FPFN_SOURCE=${FPFN_SOURCE:-oracle}
+FPFN_HEAD_NAME=${FPFN_HEAD_NAME:-null}
+FPFN_HEAD_DIR=${FPFN_HEAD_DIR:-pre-trained/fpfn-heads}
 RESULT_DIR=${RESULT_DIR:-latent_tta}
 INCLUDE_TRAIN=${INCLUDE_TRAIN:-False}
 ADAPT_LOGITS=${ADAPT_LOGITS:-False}
@@ -109,6 +115,9 @@ for DATA in ${DATASETS}; do
             ++tta.fpfn_weight="$FPFN_WEIGHT" \
             ++tta.fpfn_form="$FPFN_FORM" \
             ++tta.fpfn_fn_weight="$FPFN_FN_WEIGHT" \
+            ++tta.fpfn_source="$FPFN_SOURCE" \
+            ++tta.fpfn_head_name="$FPFN_HEAD_NAME" \
+            ++tta.fpfn_head_dir="$FPFN_HEAD_DIR" \
             ++tta.adapt_logits="$ADAPT_LOGITS" \
             ++tta.logit_lr="$LOGIT_LR" \
             ++tta.n_examples="$N_EXAMPLES" \

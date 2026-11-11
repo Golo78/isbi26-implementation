@@ -55,6 +55,16 @@ fpfn_weight: 0.0
 fpfn_form: separate
 # weight a on FN inside either form, e.g. log(1 + FP + a * FN) (> 1: missing pixels cost more)
 fpfn_fn_weight: 1.0
+# where FP and FN come from:
+#   oracle -> true soft counts from the labels (above)
+#   head   -> predicted by a trained FP/FN head (model/fpfn_head.py, train_fpfn_head.sh);
+#             label-free.  Looked up in fpfn_head_dir by fpfn_head_name (null: fpfn_<k> for
+#             ckpt_name cleanHalf_<k>), or given directly as fpfn_head_ckpt.
+# A head named with source=oracle is only evaluated along the run (fp_pred / fn_pred).
+fpfn_source: oracle
+fpfn_head_dir: pre-trained/fpfn-heads
+fpfn_head_name: null
+fpfn_head_ckpt: null
 
 # adapt_logits: additional per-channel affine on the UNet LOGITS (after the last layer),
 # seen by both the segmentation and the QC head.  Combined with adapt_sites; set

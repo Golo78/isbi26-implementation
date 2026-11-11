@@ -23,6 +23,26 @@ UNet training and eval:
 Score predictor training and eval (Beta$_{\mu,\kappa}$ QC head on top of UNet):
 - [src/apps/train_score_predictor.sh](src/apps/train_score_predictor.sh)
 
+FP/FN head training and eval ([src/model/fpfn_head.py](src/model/fpfn_head.py)): predicts
+log(1 + FP) and log(1 + FN) of the U-Net's mask (`COUNT_TARGET=hard`: thresholded mask,
+default; `soft`: probabilities as in the FP/FN oracle), MSE in log space, with the same
+architecture, swivels and hook placement as the score predictor (head `fpfn_<k>` is paired
+with `cleanHalf_<k>`), trained separately from it, and adversarial training analogous to the
+score predictor's location adversary (input steps that raise the predicted error; the step
+size is controlled so that the true hard Dice drops by 0.1, as for the score predictor):
+- [src/apps/train_fpfn_head.sh](src/apps/train_fpfn_head.sh) (one GPU) /
+  [src/apps/run_fpfn_head_queue.sh](src/apps/run_fpfn_head_queue.sh) (one head index per GPU)
+- checkpoints: `pre-trained/fpfn-heads/`, evaluation (MAE / correlation in log space, soft
+  Dice implied by the predicted counts): `results/fpfn_head/<ckpt>/eval_data.pkl`
+- `ADV_DOWN=True`: second adversary in the TTA direction (input steps that LOWER the
+  predicted error, trained on with their true counts), so that the head does not give way
+  where the TTA would exploit it; its step size is controlled so that the predicted
+  log(1 + FP + FN) drops by `ADV_DOWN_TARGET_LOG_DROP` (0.5) per step
+- batch per step: 30 clean + 30 adversarial images (+ 30 with `ADV_DOWN`). Unlike the score
+  predictor (30 clean + 15 location + 15 concentration), ONE adversary along the joint error
+  log(1 + FP + FN) gets all 30; there is no separate FP / FN adversary (see the docstring of
+  `fpfn_head.py` for why this may under-train FN directions)
+
 ## Evaluation baselines
 These scripts compute QC signals and save them into results files for later aggregation:
 - Score agreement (SA): [src/apps/eval_score_agreement.sh](src/apps/eval_score_agreement.sh)
@@ -92,6 +112,16 @@ Thin wrappers around `eval_latent_tta.sh` that fix the switches and the result d
    (`++tta.fpfn_form=joint`) descends log(1 + FP + FN) instead. `FPFN_FN_WEIGHT=a`
    (`++tta.fpfn_fn_weight=a`) weights FN inside the term, log(1 + FP + a * FN).
 
+7. **FP/FN head** — [src/apps/exp7_fpfn_head.sh](src/apps/exp7_fpfn_head.sh)
+   (`++tta.fpfn_source=head`). Experiment 6 with the true FP / FN replaced by the trained
+   FP/FN head (joint form by default): label-free. The head is attached to the score
+   predictor's wrapper and reads the features of the same forward pass, so mu-hat is
+   unchanged and the latent adapters act on both heads. The true soft FP / FN are still
+   recorded (`fp_soft_per_step`, `fn_soft_per_step`, hard: `fp_hard_per_step`,
+   `fn_hard_per_step`) next to the predictions
+   (`fp_pred_per_step`, `fn_pred_per_step`). Naming a head (`FPFN_HEAD_NAME`) with the
+   default source `oracle` only records its predictions.
+
 Every TTA run prints and stores the credible bounds before and after adaptation, so the
 kappa view is available in all experiments, as well as the hard FP / FN counts and mask
 sizes before and after adaptation (over- vs. under-segmentation).
@@ -125,6 +155,8 @@ Logs go to `logs/`.
 | `latent_tta_mu_fpfn_w<weight>` | pre-norm | sites | mu-hat + true log(1+FP) + log(1+FN) at every step | `exp6_fpfn_oracle.sh`, `run_fpfn_oracle_queue.sh` |
 | `latent_tta_mu_fpfn_joint_w<weight>` | pre-norm | sites | mu-hat + true log(1+FP+FN) at every step | `FPFN_FORM=joint` with the same scripts |
 | `latent_tta_mu_fpfn_joint_fn<a>_w<weight>` | pre-norm | sites | mu-hat + true log(1+FP+a*FN) at every step | `FPFN_FORM=joint FPFN_FN_WEIGHT=a` |
+| `latent_tta_mu_fpfnhead[_<form>][_fn<a>]_w<weight>` | pre-norm | sites | mu-hat + predicted log(1+FP+a*FN) (FP/FN head) | `exp7_fpfn_head.sh` |
+| `fpfn_head` | — | — | FP/FN head evaluation (no TTA) | `train_fpfn_head.sh` |
 
 ## Analysis notebooks
 QC analysis workflow is in [src/notebooks/QC_eval.ipynb](src/notebooks/QC_eval.ipynb). It:

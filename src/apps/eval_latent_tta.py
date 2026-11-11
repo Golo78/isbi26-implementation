@@ -33,6 +33,13 @@ independent of each other -- run one at a time):
   ++tta.fpfn_form=joint         descend log(1 + FP + FN) instead (default `separate` above,
                                 which is already minimal when FP = 0 or FN = 0).
   ++tta.fpfn_fn_weight=3.0      weight a on FN inside the FP/FN term: log(1 + FP + a * FN).
+  ++tta.fpfn_source=head        FP/FN HEAD: the same term, but with FP and FN predicted by a
+                                trained FP/FN head (model/fpfn_head.py) instead of the
+                                labels -- label-free.  The head is looked up in
+                                tta.fpfn_head_dir by tta.fpfn_head_name (default: fpfn_<k> for
+                                ckpt_name cleanHalf_<k>) or given by tta.fpfn_head_ckpt.
+                                Setting tta.fpfn_head_name with the default source (oracle)
+                                only records the head's predictions along the run.
 
 Every run stores the hard FP / FN counts and mask sizes before and after adaptation, so
 over- vs. under-segmentation can be read off for any objective.
@@ -93,6 +100,7 @@ from model.latent_adapter import (
     run_latent_tta,
 )
 from losses import unified_score_loss, soft_dice_from_logits, soft_fp_fn_from_logits, fp_fn_counts
+from model.fpfn_head import load_fpfn_head, attach_fpfn_head, find_fpfn_head_checkpoint, FPFN_HEAD
 from model.calibration import interval_report, format_interval_report
 from plot_latent_tta import plot_all
 
@@ -140,6 +148,16 @@ def make_soft_dice_fn(target: torch.Tensor, num_classes: int):
         )
 
     return oracle_fn
+
+
+def make_hard_fpfn_fn(target: torch.Tensor, num_classes: int):
+    """True FP / FN of the HARD mask per step (diagnostic only, no graph)."""
+
+    def hard_fpfn_fn(logits: torch.Tensor):
+        fp, fn, _, _ = fp_fn_counts(hard_labels(logits), target, num_classes)
+        return fp, fn
+
+    return hard_fpfn_fn
 
 
 def make_fpfn_fn(target: torch.Tensor, num_classes: int):
@@ -411,6 +429,37 @@ def main(cfg):
     # depends on the composition of the adaptation batch and the objective is corrupted
     assert not wrapper.training, "wrapper must be in eval mode for TTA"
 
+    # ---- FP/FN head (optional) ------------------------------------------------------
+    fpfn_source = str(getattr(cfg.tta, "fpfn_source", "oracle")).lower()
+    fpfn_head_ckpt = getattr(cfg.tta, "fpfn_head_ckpt", None)
+    fpfn_head_name = getattr(cfg.tta, "fpfn_head_name", None)
+    if fpfn_source == "head" or fpfn_head_ckpt or fpfn_head_name:
+        if not fpfn_head_ckpt:
+            if not fpfn_head_name:
+                # pair head k with score predictor cleanHalf_k
+                k = str(getattr(cfg, "ckpt_name", "")).rsplit("_", 1)[-1]
+                if not k.isdigit():
+                    raise ValueError("set tta.fpfn_head_name (cannot derive it from ckpt_name)")
+                fpfn_head_name = f"fpfn_{k}"
+            fpfn_head_ckpt = find_fpfn_head_checkpoint(
+                os.path.join(cfg.trainer.root_dir, str(getattr(cfg.tta, "fpfn_head_dir", "pre-trained/fpfn-heads"))),
+                dataset=cfg.data.dataset, split=cfg.data.split, name=str(fpfn_head_name),
+            )
+        fpfn_module, fpfn_meta = load_fpfn_head(str(fpfn_head_ckpt), cfg.data, unet, device)
+        if fpfn_meta.get("data_split") not in (None, str(cfg.data.split)):
+            raise ValueError(f"FP/FN head trained on split {fpfn_meta['data_split']!r}, "
+                             f"evaluating {cfg.data.split!r}")
+        head_unet = os.path.basename(str(fpfn_meta.get("unet_checkpoint", "")))
+        if head_unet and head_unet != os.path.basename(str(ckpt_path)):
+            print(f"[warn] FP/FN head was trained on U-Net {head_unet}, "
+                  f"evaluating with {os.path.basename(str(ckpt_path))}")
+        attach_fpfn_head(wrapper, fpfn_module)
+        fpfn_count_target = str(fpfn_meta.get("count_target", "hard"))
+        print(f"[info] FP/FN head: {os.path.basename(str(fpfn_head_ckpt))} (source={fpfn_source})")
+    has_fpfn_head = FPFN_HEAD in wrapper.extra_heads
+    if not has_fpfn_head:
+        fpfn_count_target = None
+
     # ---- latent adapters ------------------------------------------------------------
     sites = resolve_swivels(
         model=wrapper.model, indices=cfg_tta.adapt_sites
@@ -464,6 +513,7 @@ def main(cfg):
         + (f" - {fpfn_weight} * "
            + (f"log(1+FP+{fpfn_fn_weight}*FN)" if fpfn_form == "joint"
               else f"(log(1+FP) + log(1+{fpfn_fn_weight}*FN))")
+           + (" [head]" if fpfn_source == "head" else " [oracle]")
            if fpfn_weight else "")
     )
     if objective == "oracle-dice":
@@ -472,9 +522,11 @@ def main(cfg):
     if size_weight:
         print("[warn] SIZE ORACLE run: the size target uses the true FP/FN counts "
               "(ground-truth labels) -- not a deployable method.")
-    if fpfn_weight:
+    if fpfn_weight and fpfn_source == "oracle":
         print("[warn] FP/FN ORACLE run: the true FP/FN of every step enter the objective "
               "(ground-truth labels) -- not a deployable method.")
+    if fpfn_weight and fpfn_source == "head":
+        print("[info] FP/FN HEAD run: FP/FN predicted by the head enter the objective (label-free)")
 
     # ---- evaluate -------------------------------------------------------------------
     results: Dict[str, Dict] = {}
@@ -530,6 +582,8 @@ def main(cfg):
                 "size_target",
             )
         }
+        if has_fpfn_head:  # head prediction for the un-adapted mask, sum over fg classes
+            rows["fp_pred_before"], rows["fn_pred_before"] = [], []
         size_eps = []
         traces, steps_taken = [], []
         # per-image trajectories: one [B, S] matrix per batch, concatenated below
@@ -537,6 +591,8 @@ def main(cfg):
         kappa_steps, sigma_steps, soft_dice_steps, drift_steps = [], [], [], []
         soft_size_steps, hard_size_steps, size_loss_steps = [], [], []
         fp_soft_steps, fn_soft_steps = [], []
+        fp_pred_steps, fn_pred_steps = [], []
+        fp_hard_steps, fn_hard_steps = [], []
 
         for batch_idx, batch in enumerate(tqdm(loader, desc=domain)):
             if max_batches is not None and batch_idx >= int(max_batches):
@@ -564,6 +620,10 @@ def main(cfg):
             rows["mu_before"].append(mu0)
             rows["kappa_before"].append(kappa0)
             rows["sigma_before"].append((mu0 * (1 - mu0) / (kappa0 + 1)).sqrt())
+            if has_fpfn_head:
+                c0 = torch.expm1(wrapper.extra_predictions[FPFN_HEAD].float().clamp_min(0))
+                rows["fp_pred_before"].append(c0[..., 0].sum(1).cpu())
+                rows["fn_pred_before"].append(c0[..., 1].sum(1).cpu())
             # size ORACLE target (labels); computed in every run, used only if size_weight > 0
             size = make_size_target(logits0, t, num_classes, size_noise, size_gen)
             rows["fp_before"].append(size["fp"].sum(1))
@@ -604,6 +664,8 @@ def main(cfg):
                 fpfn_fn=make_fpfn_fn(t, num_classes),
                 fpfn_form=fpfn_form,
                 fpfn_fn_weight=fpfn_fn_weight,
+                fpfn_source=fpfn_source,
+                hard_fpfn_fn=make_hard_fpfn_fn(t, num_classes),
                 logit_lr=logit_lr,
             )
             B = x.size(0)
@@ -638,6 +700,11 @@ def main(cfg):
             size_loss_steps.append(out["per_step"]["size_loss"])
             fp_soft_steps.append(out["per_step"]["fp_soft"])
             fn_soft_steps.append(out["per_step"]["fn_soft"])
+            fp_hard_steps.append(out["per_step"]["fp_hard"])
+            fn_hard_steps.append(out["per_step"]["fn_hard"])
+            if has_fpfn_head:
+                fp_pred_steps.append(out["per_step"]["fp_pred"])
+                fn_pred_steps.append(out["per_step"]["fn_pred"])
 
             mu1 = out["prediction"][:, 0, 0].cpu()
             kappa1 = out["prediction"][:, 0, 1].cpu()
@@ -676,6 +743,20 @@ def main(cfg):
             f'   |P| {cat["size_before"].mean():.0f} -> {cat["size_after"].mean():.0f}'
             f'   (|G| {cat["size_gt"].mean():.0f})'
         )
+        if has_fpfn_head:
+            # head vs. the true counts it was trained on, un-adapted mask (log space)
+            lp = lambda a, b: torch.log1p(a + b)
+            tr = (
+                (cat["fp_before"], cat["fn_before"]) if fpfn_count_target == "hard"
+                else (torch.cat([c[:, 0] for c in fp_soft_steps]), torch.cat([c[:, 0] for c in fn_soft_steps]))
+            )
+            pr = cat["fp_pred_before"], cat["fn_pred_before"]
+            r = torch.corrcoef(torch.stack([lp(*pr), lp(*tr)]))[0, 1]
+            print(
+                f'  FP/FN head (before TTA, {fpfn_count_target} counts): FP_hat {pr[0].mean():.0f} vs FP {tr[0].mean():.0f}'
+                f'   FN_hat {pr[1].mean():.0f} vs FN {tr[1].mean():.0f}'
+                f'   r(log(1+FP+FN)) {r:.3f}'
+            )
         if size_weight:
             rel = lambda s: ((s - cat["size_target"]).abs() / cat["size_target"].clamp_min(1)).median()
             print(
@@ -778,6 +859,12 @@ def main(cfg):
             "size_loss_per_step": size_loss_per_step,    # [N, S] log-size error vs. G_hat
             "fp_soft_per_step": fp_soft_per_step,        # [N, S] true soft FP, sum over fg classes
             "fn_soft_per_step": fn_soft_per_step,        # [N, S] true soft FN
+            "fp_pred_per_step": concat_per_step(fp_pred_steps) if fp_pred_steps else torch.empty(0),  # [N, S] FP/FN head
+            "fn_pred_per_step": concat_per_step(fn_pred_steps) if fn_pred_steps else torch.empty(0),
+            "fp_hard_per_step": concat_per_step(fp_hard_steps),  # [N, S] true hard FP
+            "fn_hard_per_step": concat_per_step(fn_hard_steps),  # [N, S] true hard FN
+            "fpfn_source": fpfn_source,
+            "fpfn_count_target": fpfn_count_target,              # what the head predicts
             "size_eps": torch.cat(size_eps),             # [N, C-1, 2] noise (fp, fn)
             "best_step": best_step,
             "best_dice": best_dice,
@@ -832,6 +919,7 @@ def main(cfg):
             "tta": OmegaConf.to_container(cfg.tta),
             "score_predictor_ckpt": str(sp_ckpt),
             "unet_ckpt": str(ckpt_path),
+            "fpfn_head_ckpt": str(fpfn_head_ckpt) if has_fpfn_head else None,
         },
         "evaluation": results,
     }

@@ -50,7 +50,9 @@ size term *how much*.
 
 `fpfn_weight > 0` instead descends the TRUE soft FP and FN counts of the current mask at
 every step, anchored at 0 (`fpfn_fn`, labels) -- an oracle for a head that predicts FP and
-FN perfectly for every mask the adaptation produces.  `fpfn_form='separate'` descends
+FN perfectly for every mask the adaptation produces.  `fpfn_source='head'` replaces the true counts by the prediction of a trained
+FP/FN head (`model/fpfn_head.py`, attached as `wrapper.extra_heads['fpfn']`) -- the
+deployable, label-free version of the same term.  `fpfn_form='separate'` descends
 log(1 + FP) + log(1 + FN) = log((1 + FP)(1 + FN)), whose minimum is reached as soon as ONE of
 the two counts is 0 (e.g. an under-segmenting mask with FP = 0); `fpfn_form='joint'`
 descends log(1 + FP + FN), which only vanishes for a perfect mask.  `fpfn_fn_weight` scales
@@ -81,6 +83,7 @@ import sys
 sys.path.append('../')
 from utils import find_shapes_for_swivels
 from losses import soft_size_from_logits
+from model.fpfn_head import FPFN_HEAD
 
 
 # --------------------------------------------------------------------------------------
@@ -430,6 +433,8 @@ def run_latent_tta(
     fpfn_fn: Optional[Callable[[Tensor], Tuple[Tensor, Tensor]]] = None,
     fpfn_form: str = 'separate',
     fpfn_fn_weight: float = 1.0,
+    fpfn_source: str = 'oracle',
+    hard_fpfn_fn: Optional[Callable[[Tensor], Tuple[Tensor, Tensor]]] = None,
     logit_lr: Optional[float] = None,
 ) -> Dict:
     """Adapt the latent features of `x` by gradient ascent, then return the result.
@@ -470,6 +475,16 @@ def run_latent_tta(
 
     with a = `fpfn_fn_weight` (default 1).
 
+    `fpfn_source` selects the counts that enter this term:
+        'oracle' : the true soft counts from `fpfn_fn` (labels; default)
+        'head'   : the FP/FN head attached to `wrapper` (`wrapper.extra_heads['fpfn']`,
+                   see `model.fpfn_head.attach_fpfn_head`); label-free.  `fpfn_fn` may
+                   still be given, for reporting only.
+    Whenever the head is attached its prediction is recorded (per_step['fp_pred'],
+    per_step['fn_pred']), whatever the source.  `hard_fpfn_fn(logits) -> (fp, fn)` [B, C-1]
+    gives the true counts of the HARD mask, for reporting only (per_step['fp_hard'],
+    per_step['fn_hard']) -- the reference for a head trained on hard counts.
+
     The separate form is a log-product and is already minimal when either count is 0, so
     it can trade all FP for more FN; the joint form penalises every wrong pixel equally.
 
@@ -492,6 +507,9 @@ def run_latent_tta(
         per_step['soft_size']  : [B, S]   soft foreground size sum(p), summed over classes
         per_step['hard_size']  : [B, S]   hard foreground pixel count, summed over classes
         per_step['size_loss']  : [B, S]   log-size error vs. size_target (only if given)
+        per_step['fp_soft'], ['fn_soft'] : [B, S]  true soft FP / FN (only if fpfn_fn)
+        per_step['fp_pred'], ['fn_pred'] : [B, S]  FP/FN head prediction (only if attached)
+        per_step['fp_hard'], ['fn_hard'] : [B, S]  true hard FP / FN (only if hard_fpfn_fn)
 
     where S = steps_taken + 1 and column 0 is the un-adapted reference.  The `trace`
     entries are batch means of these, kept scalar because `should_stop` compares them.
@@ -520,11 +538,17 @@ def run_latent_tta(
         raise ValueError(f"unknown kappa_objective {kappa_objective!r}")
     if size_weight and size_target is None:
         raise ValueError("size_weight > 0 requires a `size_target` [B, C-1]")
-    if fpfn_weight and fpfn_fn is None:
-        raise ValueError("fpfn_weight > 0 requires an `fpfn_fn`")
     fpfn_form = str(fpfn_form).lower()
     if fpfn_form not in ('separate', 'joint'):
         raise ValueError(f"unknown fpfn_form {fpfn_form!r}")
+    fpfn_source = str(fpfn_source).lower()
+    if fpfn_source not in ('oracle', 'head'):
+        raise ValueError(f"fpfn_source must be 'oracle' or 'head', got {fpfn_source!r}")
+    has_head = FPFN_HEAD in getattr(wrapper, 'extra_heads', {})
+    if fpfn_weight and fpfn_source == 'oracle' and fpfn_fn is None:
+        raise ValueError("fpfn_weight > 0 with fpfn_source='oracle' requires an `fpfn_fn`")
+    if fpfn_source == 'head' and not has_head:
+        raise ValueError("fpfn_source='head' requires an FP/FN head attached to the wrapper")
 
     if reset:
         reset_adapters(adapters)
@@ -551,6 +575,10 @@ def run_latent_tta(
     size_loss_steps: List[Tensor] = []
     fp_steps: List[Tensor] = []
     fn_steps: List[Tensor] = []
+    fp_pred_steps: List[Tensor] = []
+    fn_pred_steps: List[Tensor] = []
+    fp_hard_steps: List[Tensor] = []
+    fn_hard_steps: List[Tensor] = []
     logits = None
     prediction = None
     logits0 = None
@@ -575,12 +603,19 @@ def run_latent_tta(
             )
             # true soft FP / FN of the current mask (labels) -- objective only if fpfn_weight > 0
             fp_soft, fn_soft = fpfn_fn(logits) if fpfn_fn is not None else (None, None)
-            if fp_soft is None:
+            # FP/FN head prediction (label-free), [B, C-1] counts
+            if has_head:
+                counts = torch.expm1(wrapper.extra_predictions[FPFN_HEAD].float().clamp_min(0))
+                fp_pred, fn_pred = counts[..., 0], counts[..., 1]
+            else:
+                fp_pred = fn_pred = None
+            fp_obj, fn_obj = (fp_pred, fn_pred) if fpfn_source == 'head' else (fp_soft, fn_soft)
+            if fp_obj is None:
                 fpfn_loss = None
             elif fpfn_form == 'joint':
-                fpfn_loss = torch.log1p(fp_soft + fpfn_fn_weight * fn_soft).mean(1)
+                fpfn_loss = torch.log1p(fp_obj + fpfn_fn_weight * fn_obj).mean(1)
             else:
-                fpfn_loss = (torch.log1p(fp_soft) + torch.log1p(fpfn_fn_weight * fn_soft)).mean(1)
+                fpfn_loss = (torch.log1p(fp_obj) + torch.log1p(fpfn_fn_weight * fn_obj)).mean(1)
 
         with torch.no_grad():
             if logits0 is None:
@@ -608,6 +643,13 @@ def run_latent_tta(
             if fp_soft is not None:
                 fp_steps.append(fp_soft.sum(1).detach().cpu())
                 fn_steps.append(fn_soft.sum(1).detach().cpu())
+            if fp_pred is not None:
+                fp_pred_steps.append(fp_pred.sum(1).detach().cpu())
+                fn_pred_steps.append(fn_pred.sum(1).detach().cpu())
+            if hard_fpfn_fn is not None:
+                fp_h, fn_h = hard_fpfn_fn(logits)
+                fp_hard_steps.append(fp_h.sum(1).float().cpu())
+                fn_hard_steps.append(fn_h.sum(1).float().cpu())
             if soft_dice is not None:
                 sd = soft_dice.detach().cpu()
                 soft_steps.append(sd)
@@ -649,7 +691,7 @@ def run_latent_tta(
         if size_weight:
             obj = obj - size_weight * size_loss.mean()
 
-        # simultaneous descent on the true soft FP / FN, anchored at 0 (fpfn_weight = 0 disables)
+        # simultaneous descent on the soft FP / FN (true or predicted), anchored at 0 (fpfn_weight = 0 disables)
         if fpfn_weight:
             obj = obj - fpfn_weight * fpfn_loss.mean()
 
@@ -683,6 +725,12 @@ def run_latent_tta(
     if fp_steps:
         per_step['fp_soft'] = torch.stack(fp_steps, dim=1)
         per_step['fn_soft'] = torch.stack(fn_steps, dim=1)
+    if fp_pred_steps:
+        per_step['fp_pred'] = torch.stack(fp_pred_steps, dim=1)
+        per_step['fn_pred'] = torch.stack(fn_pred_steps, dim=1)
+    if fp_hard_steps:
+        per_step['fp_hard'] = torch.stack(fp_hard_steps, dim=1)
+        per_step['fn_hard'] = torch.stack(fn_hard_steps, dim=1)
     if score_steps:
         per_step['true_score'] = torch.stack(score_steps, dim=1)
     if soft_steps:
@@ -700,5 +748,6 @@ def run_latent_tta(
         'fpfn_weight': float(fpfn_weight),
         'fpfn_form': fpfn_form,
         'fpfn_fn_weight': float(fpfn_fn_weight),
+        'fpfn_source': fpfn_source,
         'best_pred': best_pred,
     }
