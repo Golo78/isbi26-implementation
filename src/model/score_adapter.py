@@ -175,7 +175,7 @@ def get_score_prediction_module_trainer(
     os.makedirs(base_ckpt_dir, exist_ok=True)
 
     # Begin checkpointing only after adversarial skip, warmup, AND beta decay phases complete
-    start_ckpt_epoch = 150
+    start_ckpt_epoch = int(getattr(trainer_cfg, 'ckpt_start_epoch', 150))
 
     # Single directory for all checkpoints (distinguished by filename only)
     val_ckpt = DelayedModelCheckpoint(
@@ -217,6 +217,27 @@ def get_score_prediction_module_trainer(
 
 
 
+def resolve_score_swivels(unet: nn.Module, spec) -> List[str]:
+    """Module paths of the score-predictor swivels for the `model.swivels` spec.
+
+    Shared by the score (mu-hat) predictor and the FP/FN head, so that both read the same
+    features.  NOTE the last `adn.N` swivel is replaced by the logits in
+    `ScorePredictionWrapper.forward`.
+    """
+    adn = [layer[0] for layer in unet.named_modules() if 'adn.N' in layer[0]]
+    if spec in ['best', 'all']:
+        return adn
+    if spec == 'ConfidNet':
+        return ['model.2.0.adn.A']
+    indices = {
+        'embedding-last': [17, -1],
+        'embedding': [17],
+        'last': [-1],
+        'first-embedding-last': [0, 17, -1],
+    }.get(spec, [17, -1])
+    return [adn[i] for i in indices]
+
+
 def get_score_prediction_module(
     data_cfg: OmegaConf,
     model_cfg: OmegaConf,
@@ -225,21 +246,7 @@ def get_score_prediction_module(
     ckpt: Union[str, None] = None
 ):
     ### derived variables
-    if model_cfg.swivels in ['best', 'all']:
-        swivels = [layer[0] for layer in unet.named_modules()  if 'adn.N' in layer[0]]
-    elif model_cfg.swivels == 'ConfidNet':
-        swivels = ['model.2.0.adn.A']
-    elif model_cfg.swivels == 'embedding-last':
-        swivels = [[layer[0] for layer in unet.named_modules()  if 'adn.N' in layer[0]][i] for i in [17, -1]]
-    elif model_cfg.swivels == 'embedding':
-        swivels = [[layer[0] for layer in unet.named_modules()  if 'adn.N' in layer[0]][i] for i in [17]]
-    elif model_cfg.swivels == 'last':
-        swivels = [[layer[0] for layer in unet.named_modules()  if 'adn.N' in layer[0]][i] for i in [-1]]
-    elif model_cfg.swivels == 'first-embedding-last':
-        swivels = [[layer[0] for layer in unet.named_modules()  if 'adn.N' in layer[0]][i] for i in [0, 17, -1]]
-    else:
-        swivels = [[layer[0] for layer in unet.named_modules()  if 'adn.N' in layer[0]][i] for i in [17, -1]]
-        # swivels = [[layer[0] for layer in unet.named_modules()  if 'adn.N' in layer[0]][model_cfg.swivels]]
+    swivels = resolve_score_swivels(unet, model_cfg.swivels)
 
     output_shapes = find_shapes_for_swivels(
         model=unet, 
@@ -659,6 +666,11 @@ class ScorePredictionWrapper(nn.Module):
 
     The adapters are pass-through recorders either way, so the segmentation path is
     unaffected by this choice; only the features handed to the head change.
+
+    `extra_heads` (name -> head) read the SAME recorded features in the same forward pass;
+    their outputs land in `extra_predictions[name]`.  The dict is deliberately a plain
+    attribute, not a registered submodule, so attaching e.g. the FP/FN head at test time
+    (`model.fpfn_head.attach_fpfn_head`) never changes this wrapper's state_dict.
     """
 
     def __init__(
@@ -679,6 +691,8 @@ class ScorePredictionWrapper(nn.Module):
         self.adapter_handles = {}
         self.transform       = False
         self.placement       = placement
+        self.extra_heads     = {}
+        self.extra_predictions = {}
         self.model.eval()
 
         self.hook_adapters()
@@ -765,6 +779,11 @@ class ScorePredictionWrapper(nn.Module):
         # NOTE: This is hardcoded but should work for now
         output_per_adapter["model.2.0.adn.N"] = logits
 
+        # the feature fuser re-keys the dict it receives in place: every head gets a copy
+        self.extra_predictions = {
+            name: head(dict(output_per_adapter))
+            for name, head in self.extra_heads.items()
+        }
         self.prediction = self.prediction_head(
             output_per_adapter
         )
