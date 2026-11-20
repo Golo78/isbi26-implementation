@@ -18,6 +18,8 @@ adapt_sites: [0, 17]
 #                   is the upper bound of what latent adaptation could reach with a
 #                   perfect quality estimate, and the gap to `mu` is the price paid for
 #                   the imperfect mu-hat / true-Dice correlation.
+#   none         -> no score term; only the descent terms (kappa / size / FP-FN) drive the
+#                   adaptation, e.g. log(1 + FP + FN) alone (exp8).  mu-hat is only recorded.
 objective: mu
 
 # placement: where the affine is applied relative to the swivel's InstanceNorm.
@@ -65,6 +67,19 @@ fpfn_source: oracle
 fpfn_head_dir: pre-trained/fpfn-heads
 fpfn_head_name: null
 fpfn_head_ckpt: null
+# separate FP / FN heads (count_output fp / fn): fpfn_head_name / fpfn_head_ckpt is the FP-only
+# head, this one the FN-only head (null: a single joint head)
+fpfn_head_name_fn: null
+fpfn_head_ckpt_fn: null
+#   pseudo -> PSEUDO-LABEL ORACLE: the oracle formula against a corrupted label map g_hat
+#             (fixed per image, no gradient; labels!) -- how good must a dense head be?
+#     recall: g_hat = P_0 with a fraction pseudo_level of its error pixels corrected
+#             (smooth random blobs of ~pseudo_cell px); 1 = oracle, 0 = g_hat = P_0
+#     morph : g_hat = GT dilated (pseudo_level > 0) / eroded (< 0) by |pseudo_level| px
+pseudo_mode: recall
+pseudo_level: 1.0
+pseudo_cell: 16
+pseudo_seed: 0
 
 # adapt_logits: additional per-channel affine on the UNet LOGITS (after the last layer),
 # seen by both the segmentation and the QC head.  Combined with adapt_sites; set

@@ -25,7 +25,13 @@ set -euo pipefail
 #   FPFN_FORM       separate (log(1+FP) + log(1+FN), default) | joint (log(1+FP+FN))
 #   FPFN_FN_WEIGHT  weight of FN inside the FP/FN term (default 1.0)
 #   FPFN_SOURCE     oracle (true FP/FN, labels; default) | head (trained FP/FN head, label-free)
+#                   | pseudo (oracle formula against a corrupted GT, see PSEUDO_*)
+#   PSEUDO_MODE     recall (fraction of P_0's errors corrected) | morph (GT dilated/eroded)
+#   PSEUDO_LEVEL    recall: fraction in [0,1];  morph: radius in px (>0 dilate, <0 erode)
+#   PSEUDO_CELL     blob size in px of the recall noise field (default 16)
+#   PSEUDO_SEED     seed of the recall noise (default 0)
 #   FPFN_HEAD_NAME  FP/FN head checkpoint name (default null: fpfn_<k> for CKPT_NAME cleanHalf_<k>)
+#   FPFN_HEAD_NAME_FN  separate heads: name of the FN-only head (FPFN_HEAD_NAME = the FP-only head)
 #   FPFN_HEAD_DIR   folder of the FP/FN heads (default pre-trained/fpfn-heads)
 #   ADAPT_LOGITS    True | False       (additional affine on the UNet logits)
 #   LOGIT_LR        Adam lr of the logit affine (default: null = same lr)
@@ -58,7 +64,12 @@ FPFN_FORM=${FPFN_FORM:-separate}
 FPFN_FN_WEIGHT=${FPFN_FN_WEIGHT:-1.0}
 FPFN_SOURCE=${FPFN_SOURCE:-oracle}
 FPFN_HEAD_NAME=${FPFN_HEAD_NAME:-null}
+PSEUDO_MODE=${PSEUDO_MODE:-recall}
+PSEUDO_LEVEL=${PSEUDO_LEVEL:-1.0}
+PSEUDO_CELL=${PSEUDO_CELL:-16}
+PSEUDO_SEED=${PSEUDO_SEED:-0}
 FPFN_HEAD_DIR=${FPFN_HEAD_DIR:-pre-trained/fpfn-heads}
+FPFN_HEAD_NAME_FN=${FPFN_HEAD_NAME_FN:-null}
 RESULT_DIR=${RESULT_DIR:-latent_tta}
 INCLUDE_TRAIN=${INCLUDE_TRAIN:-False}
 ADAPT_LOGITS=${ADAPT_LOGITS:-False}
@@ -118,6 +129,11 @@ for DATA in ${DATASETS}; do
             ++tta.fpfn_source="$FPFN_SOURCE" \
             ++tta.fpfn_head_name="$FPFN_HEAD_NAME" \
             ++tta.fpfn_head_dir="$FPFN_HEAD_DIR" \
+            ++tta.fpfn_head_name_fn="$FPFN_HEAD_NAME_FN" \
+            ++tta.pseudo_mode="$PSEUDO_MODE" \
+            ++tta.pseudo_level="$PSEUDO_LEVEL" \
+            ++tta.pseudo_cell="$PSEUDO_CELL" \
+            ++tta.pseudo_seed="$PSEUDO_SEED" \
             ++tta.adapt_logits="$ADAPT_LOGITS" \
             ++tta.logit_lr="$LOGIT_LR" \
             ++tta.n_examples="$N_EXAMPLES" \

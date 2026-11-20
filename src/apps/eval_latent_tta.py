@@ -13,6 +13,9 @@ independent of each other -- run one at a time):
                                 latent adaptation could achieve with a perfect quality
                                 estimate, i.e. isolates how much of the gain depends on
                                 the mu-hat / true-Dice correlation.
+  ++tta.objective=none          no score term: only the descent terms below drive the
+                                adaptation (e.g. log(1 + FP + FN) alone, experiment 8).
+                                mu-hat is still recorded, but never enters the objective.
   ++tta.placement=pre           Move the latent adapter from post-norm to PRE-norm.
   ++tta.kappa_weight=0.1        Descend the predictive uncertainty (Beta sigma, or
                                 -log kappa via ++tta.kappa_objective=log-kappa)
@@ -40,6 +43,21 @@ independent of each other -- run one at a time):
                                 ckpt_name cleanHalf_<k>) or given by tta.fpfn_head_ckpt.
                                 Setting tta.fpfn_head_name with the default source (oracle)
                                 only records the head's predictions along the run.
+                                Separate FP / FN heads: tta.fpfn_head_name is the FP-only head,
+                                tta.fpfn_head_name_fn (or tta.fpfn_head_ckpt_fn) the FN-only head.
+  ++tta.fpfn_source=pseudo      PSEUDO-LABEL ORACLE: the oracle formula FP = sum p(1 - g_hat),
+                                FN = sum (1 - p) g_hat, but against a CORRUPTED label map
+                                g_hat (fixed per image, no gradient) -- how good must a dense
+                                error-map / pseudo-label head be?  ++tta.pseudo_mode selects
+                                the corruption, ++tta.pseudo_level its strength:
+                                  recall  g_hat = P_0 with a fraction `level` of P_0's error
+                                          pixels corrected (spatially coherent blobs of
+                                          ~tta.pseudo_cell px).  1 = oracle, 0 = g_hat = P_0
+                                          (self-training: nothing to correct).
+                                  morph   g_hat = GT dilated (level > 0) / eroded (level < 0)
+                                          by |level| px (disk): a systematic boundary bias.
+                                The reported FP / FN / Dice stay against the TRUE labels;
+                                pseudo_dice / pseudo_fp / pseudo_fn rate g_hat itself.
 
 Every run stores the hard FP / FN counts and mask sizes before and after adaptation, so
 over- vs. under-segmentation can be read off for any objective.
@@ -196,6 +214,61 @@ def make_size_target(
         "target": g_hat.to(logits0.device),
         "fp": fp, "fn": fn, "pred_size": p_size, "gt_size": g_size, "eps": eps,
     }
+
+
+@torch.no_grad()
+def make_pseudo_target(
+    logits0: torch.Tensor,
+    target: torch.Tensor,
+    mode: str,
+    level: float,
+    cell: int = 16,
+    generator: torch.Generator = None,
+) -> torch.Tensor:
+    """Corrupted label map g_hat [B, H, W] (long) for the PSEUDO-LABEL oracle.
+
+    It needs labels and only simulates a dense head that tells WHERE the errors are:
+      recall : start from the un-adapted hard mask P_0 and correct a fraction `level` of its
+               error pixels (P_0 != G).  The corrected pixels are chosen by a smooth random
+               field (uniform noise on a grid of `cell` px, bilinearly upsampled), so whole
+               regions are found or missed together rather than isolated pixels.
+      morph  : the GT dilated (level > 0) or eroded (level < 0) by round(|level|) px with a
+               disk (binary only).
+    The noise is drawn on the cpu with `generator`, so it does not depend on the GPU.
+    """
+    p0 = hard_labels(logits0).long()                      # [B, H, W]
+    g = target.reshape(p0.shape).long()
+    if mode == "recall":
+        level = float(level)
+        if not 0.0 <= level <= 1.0:
+            raise ValueError(f"pseudo_level for mode 'recall' must be in [0, 1], got {level}")
+        B, H, W = p0.shape
+        coarse = torch.rand(B, 1, H // cell + 2, W // cell + 2, generator=generator)
+        field = torch.nn.functional.interpolate(
+            coarse, size=(H, W), mode="bilinear", align_corners=False
+        )[:, 0].to(p0.device)
+        err = p0 != g
+        sel = torch.zeros_like(err)
+        for b in range(B):
+            vals = field[b][err[b]]
+            k = int(round(level * vals.numel()))
+            if k > 0:
+                thr = vals.kthvalue(k).values
+                sel[b] = err[b] & (field[b] <= thr)
+        return torch.where(sel, g, p0)
+    if mode == "morph":
+        if int(g.max()) > 1:
+            raise ValueError("pseudo_mode 'morph' is implemented for binary labels only")
+        r = int(round(abs(float(level))))
+        if r == 0:
+            return g
+        yy, xx = torch.meshgrid(torch.arange(-r, r + 1), torch.arange(-r, r + 1), indexing="ij")
+        disk = ((yy ** 2 + xx ** 2) <= r * r).float().to(g.device)[None, None]
+        hits = torch.nn.functional.conv2d(g[:, None].float(), disk, padding=r)[:, 0]
+        if level > 0:  # dilation: any GT pixel under the disk
+            return (hits > 0.5).long()
+        return (hits > disk.sum() - 0.5).long()  # erosion: disk fully inside the GT
+    raise ValueError(f"unknown pseudo_mode {mode!r} (recall | morph)")
 
 
 def hard_labels(logits: torch.Tensor) -> torch.Tensor:
@@ -432,6 +505,7 @@ def main(cfg):
     # ---- FP/FN head (optional) ------------------------------------------------------
     fpfn_source = str(getattr(cfg.tta, "fpfn_source", "oracle")).lower()
     fpfn_head_ckpt = getattr(cfg.tta, "fpfn_head_ckpt", None)
+    fpfn_head_ckpt_fn = None
     fpfn_head_name = getattr(cfg.tta, "fpfn_head_name", None)
     if fpfn_source == "head" or fpfn_head_ckpt or fpfn_head_name:
         if not fpfn_head_ckpt:
@@ -445,17 +519,30 @@ def main(cfg):
                 os.path.join(cfg.trainer.root_dir, str(getattr(cfg.tta, "fpfn_head_dir", "pre-trained/fpfn-heads"))),
                 dataset=cfg.data.dataset, split=cfg.data.split, name=str(fpfn_head_name),
             )
-        fpfn_module, fpfn_meta = load_fpfn_head(str(fpfn_head_ckpt), cfg.data, unet, device)
-        if fpfn_meta.get("data_split") not in (None, str(cfg.data.split)):
-            raise ValueError(f"FP/FN head trained on split {fpfn_meta['data_split']!r}, "
-                             f"evaluating {cfg.data.split!r}")
-        head_unet = os.path.basename(str(fpfn_meta.get("unet_checkpoint", "")))
-        if head_unet and head_unet != os.path.basename(str(ckpt_path)):
-            print(f"[warn] FP/FN head was trained on U-Net {head_unet}, "
-                  f"evaluating with {os.path.basename(str(ckpt_path))}")
-        attach_fpfn_head(wrapper, fpfn_module)
+        fpfn_head_ckpt_fn = getattr(cfg.tta, "fpfn_head_ckpt_fn", None)
+        fpfn_head_name_fn = getattr(cfg.tta, "fpfn_head_name_fn", None)
+        if fpfn_head_name_fn and not fpfn_head_ckpt_fn:
+            fpfn_head_ckpt_fn = find_fpfn_head_checkpoint(
+                os.path.join(cfg.trainer.root_dir, str(getattr(cfg.tta, "fpfn_head_dir", "pre-trained/fpfn-heads"))),
+                dataset=cfg.data.dataset, split=cfg.data.split, name=str(fpfn_head_name_fn),
+            )
+        loaded = []
+        for path in [fpfn_head_ckpt] + ([fpfn_head_ckpt_fn] if fpfn_head_ckpt_fn else []):
+            module, meta = load_fpfn_head(str(path), cfg.data, unet, device)
+            if meta.get("data_split") not in (None, str(cfg.data.split)):
+                raise ValueError(f"FP/FN head trained on split {meta['data_split']!r}, "
+                                 f"evaluating {cfg.data.split!r}")
+            head_unet = os.path.basename(str(meta.get("unet_checkpoint", "")))
+            if head_unet and head_unet != os.path.basename(str(ckpt_path)):
+                print(f"[warn] FP/FN head was trained on U-Net {head_unet}, "
+                      f"evaluating with {os.path.basename(str(ckpt_path))}")
+            loaded.append((module, meta))
+        fpfn_module, fpfn_meta = loaded[0]
+        attach_fpfn_head(wrapper, fpfn_module, loaded[1][0] if len(loaded) > 1 else None)
         fpfn_count_target = str(fpfn_meta.get("count_target", "hard"))
-        print(f"[info] FP/FN head: {os.path.basename(str(fpfn_head_ckpt))} (source={fpfn_source})")
+        print(f"[info] FP/FN head: {os.path.basename(str(fpfn_head_ckpt))}"
+              + (f" (FP) + {os.path.basename(str(fpfn_head_ckpt_fn))} (FN)" if fpfn_head_ckpt_fn else "")
+              + f" (source={fpfn_source})")
     has_fpfn_head = FPFN_HEAD in wrapper.extra_heads
     if not has_fpfn_head:
         fpfn_count_target = None
@@ -493,6 +580,12 @@ def main(cfg):
     fpfn_weight = float(getattr(cfg_tta, "fpfn_weight", 0.0))
     fpfn_form = str(getattr(cfg_tta, "fpfn_form", "separate"))
     fpfn_fn_weight = float(getattr(cfg_tta, "fpfn_fn_weight", 1.0))
+    pseudo_mode = str(getattr(cfg_tta, "pseudo_mode", "recall")).lower()
+    pseudo_level = float(getattr(cfg_tta, "pseudo_level", 1.0))
+    pseudo_cell = int(getattr(cfg_tta, "pseudo_cell", 16))
+    pseudo_seed = int(getattr(cfg_tta, "pseudo_seed", 0))
+    pseudo_gen = torch.Generator()
+    use_pseudo = fpfn_source == "pseudo"
     thr_cfg = getattr(cfg_tta, "threshold_oracle", None) or {}
     thr_shifts = threshold_grid(
         thr_cfg.get("min", -16.0), thr_cfg.get("max", 16.0), thr_cfg.get("num", 321)
@@ -513,7 +606,7 @@ def main(cfg):
         + (f" - {fpfn_weight} * "
            + (f"log(1+FP+{fpfn_fn_weight}*FN)" if fpfn_form == "joint"
               else f"(log(1+FP) + log(1+{fpfn_fn_weight}*FN))")
-           + (" [head]" if fpfn_source == "head" else " [oracle]")
+           + {"head": " [head]", "pseudo": f" [pseudo {pseudo_mode} {pseudo_level}]"}.get(fpfn_source, " [oracle]")
            if fpfn_weight else "")
     )
     if objective == "oracle-dice":
@@ -525,6 +618,9 @@ def main(cfg):
     if fpfn_weight and fpfn_source == "oracle":
         print("[warn] FP/FN ORACLE run: the true FP/FN of every step enter the objective "
               "(ground-truth labels) -- not a deployable method.")
+    if fpfn_weight and use_pseudo:
+        print(f"[warn] PSEUDO-LABEL ORACLE run: FP/FN against a corrupted GT "
+              f"(mode={pseudo_mode}, level={pseudo_level}) -- uses labels, not deployable.")
     if fpfn_weight and fpfn_source == "head":
         print("[info] FP/FN HEAD run: FP/FN predicted by the head enter the objective (label-free)")
 
@@ -556,6 +652,7 @@ def main(cfg):
         thr_dice, thr_shift, thr_scores = [], [], []
         # same noise draws for every predictor / run: reseed per domain
         size_gen.manual_seed(size_noise_seed)
+        pseudo_gen.manual_seed(pseudo_seed)
         logit_log_gamma, logit_beta = [], []
         offset = 0
 
@@ -584,6 +681,10 @@ def main(cfg):
         }
         if has_fpfn_head:  # head prediction for the un-adapted mask, sum over fg classes
             rows["fp_pred_before"], rows["fn_pred_before"] = [], []
+        if use_pseudo:  # quality of the pseudo label map against the true labels
+            rows["pseudo_dice"], rows["pseudo_fp"], rows["pseudo_fn"] = [], [], []
+            examples["pseudo_target"] = []
+        fp_pseudo_steps, fn_pseudo_steps = [], []
         size_eps = []
         traces, steps_taken = [], []
         # per-image trajectories: one [B, S] matrix per batch, concatenated below
@@ -633,6 +734,20 @@ def main(cfg):
             rows["size_target"].append(size["target"].sum(1).cpu())
             size_eps.append(size["eps"])
 
+            # PSEUDO-LABEL oracle: corrupted label map, fixed for the whole run (labels!)
+            pseudo_fpfn_fn, g_hat = None, None
+            if use_pseudo:
+                g_hat = make_pseudo_target(logits0, t, pseudo_mode, pseudo_level,
+                                           pseudo_cell, pseudo_gen)
+                pseudo_fpfn_fn = make_fpfn_fn(g_hat, num_classes)
+                pfp, pfn, psz, gsz = fp_fn_counts(g_hat, t, num_classes)
+                pfp, pfn, psz, gsz = (v.sum(1).cpu() for v in (pfp, pfn, psz, gsz))
+                den = psz + gsz
+                rows["pseudo_dice"].append(torch.where(
+                    den > 0, 2 * (psz - pfp) / den.clamp_min(1), torch.ones_like(den)))
+                rows["pseudo_fp"].append(pfp)
+                rows["pseudo_fn"].append(pfn)
+
             # ORACLE: best Dice by moving only the final threshold of the UN-adapted logits
             thr = threshold_oracle(logits0, score_fn, thr_shifts)
             thr_dice.append(thr["dice"].cpu())
@@ -666,6 +781,7 @@ def main(cfg):
                 fpfn_fn_weight=fpfn_fn_weight,
                 fpfn_source=fpfn_source,
                 hard_fpfn_fn=make_hard_fpfn_fn(t, num_classes),
+                pseudo_fpfn_fn=pseudo_fpfn_fn,
                 logit_lr=logit_lr,
             )
             B = x.size(0)
@@ -684,6 +800,8 @@ def main(cfg):
                 examples["pred_best"].append(out["best_pred"][sel, 0].cpu())
                 examples["pred_final"].append(hard_labels(out["logits"][sel]).cpu())
                 examples["pred_threshold"].append(thr["pred"][sel].cpu())
+                if use_pseudo:
+                    examples["pseudo_target"].append(g_hat[sel].to(torch.uint8).cpu())
             offset += B
 
             traces.append(out["trace"])
@@ -705,6 +823,9 @@ def main(cfg):
             if has_fpfn_head:
                 fp_pred_steps.append(out["per_step"]["fp_pred"])
                 fn_pred_steps.append(out["per_step"]["fn_pred"])
+            if use_pseudo:
+                fp_pseudo_steps.append(out["per_step"]["fp_pseudo"])
+                fn_pseudo_steps.append(out["per_step"]["fn_pseudo"])
 
             mu1 = out["prediction"][:, 0, 0].cpu()
             kappa1 = out["prediction"][:, 0, 1].cpu()
@@ -756,6 +877,12 @@ def main(cfg):
                 f'  FP/FN head (before TTA, {fpfn_count_target} counts): FP_hat {pr[0].mean():.0f} vs FP {tr[0].mean():.0f}'
                 f'   FN_hat {pr[1].mean():.0f} vs FN {tr[1].mean():.0f}'
                 f'   r(log(1+FP+FN)) {r:.3f}'
+            )
+        if use_pseudo:
+            print(
+                f'  pseudo labels ({pseudo_mode} {pseudo_level}): Dice(g_hat, G) '
+                f'{cat["pseudo_dice"].mean():.4f} (P_0: {cat["dice_before"].mean():.4f})'
+                f'   FP {cat["pseudo_fp"].mean():.0f}   FN {cat["pseudo_fn"].mean():.0f}'
             )
         if size_weight:
             rel = lambda s: ((s - cat["size_target"]).abs() / cat["size_target"].clamp_min(1)).median()
@@ -863,6 +990,12 @@ def main(cfg):
             "fn_pred_per_step": concat_per_step(fn_pred_steps) if fn_pred_steps else torch.empty(0),
             "fp_hard_per_step": concat_per_step(fp_hard_steps),  # [N, S] true hard FP
             "fn_hard_per_step": concat_per_step(fn_hard_steps),  # [N, S] true hard FN
+            "fp_pseudo_per_step": concat_per_step(fp_pseudo_steps) if fp_pseudo_steps else torch.empty(0),  # [N, S] vs g_hat
+            "fn_pseudo_per_step": concat_per_step(fn_pseudo_steps) if fn_pseudo_steps else torch.empty(0),
+            "pseudo_mode": pseudo_mode if use_pseudo else None,
+            "pseudo_level": pseudo_level if use_pseudo else None,
+            "pseudo_cell": pseudo_cell if use_pseudo else None,
+            "pseudo_seed": pseudo_seed if use_pseudo else None,
             "fpfn_source": fpfn_source,
             "fpfn_count_target": fpfn_count_target,              # what the head predicts
             "size_eps": torch.cat(size_eps),             # [N, C-1, 2] noise (fp, fn)
@@ -920,6 +1053,7 @@ def main(cfg):
             "score_predictor_ckpt": str(sp_ckpt),
             "unet_ckpt": str(ckpt_path),
             "fpfn_head_ckpt": str(fpfn_head_ckpt) if has_fpfn_head else None,
+            "fpfn_head_ckpt_fn": str(fpfn_head_ckpt_fn) if has_fpfn_head and fpfn_head_ckpt_fn else None,
         },
         "evaluation": results,
     }

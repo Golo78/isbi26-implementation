@@ -52,7 +52,9 @@ size term *how much*.
 every step, anchored at 0 (`fpfn_fn`, labels) -- an oracle for a head that predicts FP and
 FN perfectly for every mask the adaptation produces.  `fpfn_source='head'` replaces the true counts by the prediction of a trained
 FP/FN head (`model/fpfn_head.py`, attached as `wrapper.extra_heads['fpfn']`) -- the
-deployable, label-free version of the same term.  `fpfn_form='separate'` descends
+deployable, label-free version of the same term.  `fpfn_source='pseudo'` keeps the oracle
+formula but replaces the labels by a fixed pseudo label map g_hat (`pseudo_fpfn_fn`), e.g. a
+corrupted ground truth (how good must g_hat be?) or a dense error-map head.  `fpfn_form='separate'` descends
 log(1 + FP) + log(1 + FN) = log((1 + FP)(1 + FN)), whose minimum is reached as soon as ONE of
 the two counts is 0 (e.g. an under-segmenting mask with FP = 0); `fpfn_form='joint'`
 descends log(1 + FP + FN), which only vanishes for a perfect mask.  `fpfn_fn_weight` scales
@@ -435,6 +437,7 @@ def run_latent_tta(
     fpfn_fn_weight: float = 1.0,
     fpfn_source: str = 'oracle',
     hard_fpfn_fn: Optional[Callable[[Tensor], Tuple[Tensor, Tensor]]] = None,
+    pseudo_fpfn_fn: Optional[Callable[[Tensor], Tuple[Tensor, Tensor]]] = None,
     logit_lr: Optional[float] = None,
 ) -> Dict:
     """Adapt the latent features of `x` by gradient ascent, then return the result.
@@ -453,6 +456,10 @@ def run_latent_tta(
         ORACLE: not deployable, but it bounds what latent adaptation could deliver if the
         quality estimate were perfect, and the gap to objective='mu' is exactly the price
         of an imperfect mu-hat / true-Dice correlation.
+    objective='none'
+        no score term at all: the adaptation is driven only by the descent terms below
+        (kappa / size / FP-FN; at least one must be active).  mu-hat is still recorded.
+        With a single active term the Adam update is (up to eps) invariant to its weight.
 
     `kappa_weight > 0` additionally descends the QC head's predictive uncertainty at every
     step (simultaneously, in one combined objective, not in an alternating scheme):
@@ -480,6 +487,11 @@ def run_latent_tta(
         'head'   : the FP/FN head attached to `wrapper` (`wrapper.extra_heads['fpfn']`,
                    see `model.fpfn_head.attach_fpfn_head`); label-free.  `fpfn_fn` may
                    still be given, for reporting only.
+        'pseudo' : soft counts against a PSEUDO label map g_hat, `pseudo_fpfn_fn(logits)`
+                   (same formula as 'oracle', FP = sum p (1 - g_hat), FN = sum (1 - p) g_hat,
+                   g_hat fixed and without gradient).  The gradient therefore reaches the
+                   adapters only through the mask, exactly as for the oracle; `fpfn_fn` keeps
+                   reporting the TRUE counts.  Recorded as per_step['fp_pseudo'], ['fn_pseudo'].
     Whenever the head is attached its prediction is recorded (per_step['fp_pred'],
     per_step['fn_pred']), whatever the source.  `hard_fpfn_fn(logits) -> (fp, fn)` [B, C-1]
     gives the true counts of the HARD mask, for reporting only (per_step['fp_hard'],
@@ -529,8 +541,11 @@ def run_latent_tta(
     `per_step['true_score']`) -- an oracle read-out for qualitative analysis only.
     """
     objective = str(objective).lower()
-    if objective not in ('mu', 'oracle-dice'):
-        raise ValueError(f"objective must be 'mu' or 'oracle-dice', got {objective!r}")
+    if objective not in ('mu', 'oracle-dice', 'none'):
+        raise ValueError(f"objective must be 'mu', 'oracle-dice' or 'none', got {objective!r}")
+    if objective == 'none' and not (kappa_weight or size_weight or fpfn_weight):
+        raise ValueError("objective='none' needs at least one active term "
+                         "(kappa_weight, size_weight or fpfn_weight > 0)")
     if objective == 'oracle-dice' and oracle_fn is None:
         raise ValueError("objective='oracle-dice' requires a differentiable `oracle_fn`")
     kappa_objective = str(kappa_objective).lower()
@@ -542,8 +557,10 @@ def run_latent_tta(
     if fpfn_form not in ('separate', 'joint'):
         raise ValueError(f"unknown fpfn_form {fpfn_form!r}")
     fpfn_source = str(fpfn_source).lower()
-    if fpfn_source not in ('oracle', 'head'):
-        raise ValueError(f"fpfn_source must be 'oracle' or 'head', got {fpfn_source!r}")
+    if fpfn_source not in ('oracle', 'head', 'pseudo'):
+        raise ValueError(f"fpfn_source must be 'oracle', 'head' or 'pseudo', got {fpfn_source!r}")
+    if fpfn_source == 'pseudo' and pseudo_fpfn_fn is None:
+        raise ValueError("fpfn_source='pseudo' requires a `pseudo_fpfn_fn`")
     has_head = FPFN_HEAD in getattr(wrapper, 'extra_heads', {})
     if fpfn_weight and fpfn_source == 'oracle' and fpfn_fn is None:
         raise ValueError("fpfn_weight > 0 with fpfn_source='oracle' requires an `fpfn_fn`")
@@ -579,6 +596,8 @@ def run_latent_tta(
     fn_pred_steps: List[Tensor] = []
     fp_hard_steps: List[Tensor] = []
     fn_hard_steps: List[Tensor] = []
+    fp_pseudo_steps: List[Tensor] = []
+    fn_pseudo_steps: List[Tensor] = []
     logits = None
     prediction = None
     logits0 = None
@@ -609,7 +628,11 @@ def run_latent_tta(
                 fp_pred, fn_pred = counts[..., 0], counts[..., 1]
             else:
                 fp_pred = fn_pred = None
-            fp_obj, fn_obj = (fp_pred, fn_pred) if fpfn_source == 'head' else (fp_soft, fn_soft)
+            # soft FP / FN against the pseudo label map (no labels at test time if g_hat is a head's)
+            fp_pseudo, fn_pseudo = (pseudo_fpfn_fn(logits) if pseudo_fpfn_fn is not None
+                                    else (None, None))
+            fp_obj, fn_obj = {'head': (fp_pred, fn_pred), 'pseudo': (fp_pseudo, fn_pseudo)}.get(
+                fpfn_source, (fp_soft, fn_soft))
             if fp_obj is None:
                 fpfn_loss = None
             elif fpfn_form == 'joint':
@@ -646,6 +669,9 @@ def run_latent_tta(
             if fp_pred is not None:
                 fp_pred_steps.append(fp_pred.sum(1).detach().cpu())
                 fn_pred_steps.append(fn_pred.sum(1).detach().cpu())
+            if fp_pseudo is not None:
+                fp_pseudo_steps.append(fp_pseudo.sum(1).detach().cpu())
+                fn_pseudo_steps.append(fn_pseudo.sum(1).detach().cpu())
             if hard_fpfn_fn is not None:
                 fp_h, fn_h = hard_fpfn_fn(logits)
                 fp_hard_steps.append(fp_h.sum(1).float().cpu())
@@ -677,8 +703,10 @@ def run_latent_tta(
         # Die Orakel-Variante ersetzt genau diesen Schaetzer durch den echten (weichen) Dice.
         if objective == 'mu':
             obj = mu.mean()
-        else:
+        elif objective == 'oracle-dice':
             obj = soft_dice.mean()
+        else:  # 'none': no score term, only the descent terms below (mu-hat is only recorded)
+            obj = logits.new_zeros(())
 
         # simultaneous descent on the predicted uncertainty (kappa_weight = 0 disables)
         if kappa_weight:
@@ -728,6 +756,9 @@ def run_latent_tta(
     if fp_pred_steps:
         per_step['fp_pred'] = torch.stack(fp_pred_steps, dim=1)
         per_step['fn_pred'] = torch.stack(fn_pred_steps, dim=1)
+    if fp_pseudo_steps:
+        per_step['fp_pseudo'] = torch.stack(fp_pseudo_steps, dim=1)
+        per_step['fn_pseudo'] = torch.stack(fn_pseudo_steps, dim=1)
     if fp_hard_steps:
         per_step['fp_hard'] = torch.stack(fp_hard_steps, dim=1)
         per_step['fn_hard'] = torch.stack(fn_hard_steps, dim=1)
