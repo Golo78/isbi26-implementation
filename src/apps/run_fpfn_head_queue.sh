@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Train the FP/FN heads fpfn_<k> for all pmri splits (train_fpfn_head.sh), one head index k
 # per GPU at a time; each job trains the three splits in sequence.
+# Logs: logs/train_<NAME_OVERRIDE|fpfn>_head_<k>.log
 #   usage: GPUS="2 3 4 6 7" [ITERS="0 1 2 3 4"] [other train_fpfn_head.sh overrides] bash run_fpfn_head_queue.sh
 set -uo pipefail
 
@@ -13,7 +14,7 @@ mkdir -p "$LOGDIR"
 run_gpu() {
     local gpu=$1; shift
     for k in "$@"; do
-        local log="$LOGDIR/train_fpfn_head_${k}.log"
+        local log="$LOGDIR/train_${NAME_OVERRIDE:-fpfn}_head_${k}.log"
         echo "[$(date +%H:%M)] GPU $gpu: fpfn_$k -> $log"
         CUDA_DEVICE=$gpu ITERATIONS=$k bash "$HERE/train_fpfn_head.sh" > "$log" 2>&1 \
             || echo "[$(date +%H:%M)]   !! FAILED: fpfn_$k (see $log)"

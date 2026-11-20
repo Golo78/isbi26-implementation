@@ -16,8 +16,11 @@ set -euo pipefail
 #   PERTURBATION      predictor | none
 #   ADV_TARGET_DICE_DROP  target drop of the true hard Dice per adversarial step (default 0.1)
 #   COUNT_TARGET      hard (thresholded mask, default) | soft (probabilities)
+#   ADV_MODE          joint (one adversary on log(1+FP+FN), default) | split (B/2 FP + B/2 FN adversary)
 #   ADV_DOWN          True: second adversary in the TTA direction (lowers the predicted error)
 #   ADV_DOWN_TARGET_LOG_DROP  its target drop of the predicted log(1+FP+FN) per step (default 0.5)
+#   COUNT_OUTPUT      both (default) | fp | fn: separate FP / FN heads (loss + adversary on one count)
+#   LR_MONITOR        val_loss (default, as all heads so far) | val_loss_clean (LR schedule on the clean loss)
 #   REGRESSION_LOSS   mse | huber
 #   LOGGING           True | False (wandb)
 #   NAME_OVERRIDE     checkpoint name prefix (default fpfn; e.g. fpfnsoft for COUNT_TARGET=soft)
@@ -33,8 +36,11 @@ ADVERSARIAL_SKIP_EPOCHS=${ADVERSARIAL_SKIP_EPOCHS:-40}
 ADVERSARIAL_WARMUP_EPOCHS=${ADVERSARIAL_WARMUP_EPOCHS:-30}
 ADV_TARGET_DICE_DROP=${ADV_TARGET_DICE_DROP:-0.1}
 COUNT_TARGET=${COUNT_TARGET:-hard}
+ADV_MODE=${ADV_MODE:-joint}
 ADV_DOWN=${ADV_DOWN:-False}
 ADV_DOWN_TARGET_LOG_DROP=${ADV_DOWN_TARGET_LOG_DROP:-0.5}
+COUNT_OUTPUT=${COUNT_OUTPUT:-both}
+LR_MONITOR=${LR_MONITOR:-val_loss}
 REGRESSION_LOSS=${REGRESSION_LOSS:-mse}
 LOGGING=${LOGGING:-True}
 TRAIN=${TRAIN:-True}
@@ -66,8 +72,11 @@ for ITER in $ITERATIONS; do
             ++model.adversarial_warmup_epochs="$ADVERSARIAL_WARMUP_EPOCHS" \
             ++model.adv_target_dice_drop="$ADV_TARGET_DICE_DROP" \
             ++model.count_target="$COUNT_TARGET" \
+            ++model.adv_mode="$ADV_MODE" \
             ++model.adv_down="$ADV_DOWN" \
             ++model.adv_down_target_log_drop="$ADV_DOWN_TARGET_LOG_DROP" \
+            ++model.count_output="$COUNT_OUTPUT" \
+            ++model.lr_monitor="$LR_MONITOR" \
             ++model.regression_loss="$REGRESSION_LOSS" \
             +trainer=score_predictor_trainer \
             ++trainer.limit_train_batches="$N_BATCHES" \

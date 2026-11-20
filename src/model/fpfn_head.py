@@ -40,8 +40,15 @@ single adversary along the JOINT error gets all B images; there is no separate F
 adversary.  The joint gradient is dominated by the larger predicted count
 (d log(1 + FP_hat + FN_hat) = (dFP_hat + dFN_hat) / (1 + FP_hat + FN_hat); FP_hat 797 vs.
 FN_hat 320 on 3T->1.5T), so directions in which FN rises are rarely trained on -- a
-plausible, unverified cause of the ~5x FN underestimation under shift.  Open alternative:
-one FP and one FN adversary with B/2 images each, each with its own controller.
+plausible, unverified cause of the ~5x FN underestimation under shift.
+
+`adv_mode='split'` replaces the joint adversary by one FP and one FN adversary, split like
+the score predictor's location / concentration adversaries: the first B/2 clean images move
+along +d log(1 + FP_hat) / dx, the other B/2 along +d log(1 + FN_hat) / dx, each half with its
+own step-size controller on the same target (true hard Dice drop of `adv_target_dice_drop`).
+Same number of adversarial images (B) as the joint mode.  Both modes log, per adversary,
+how much the TRUE log(1 + FP) and log(1 + FN) of the moved images rose
+(`adv[_fp|_fn]_true_dlog_fp|fn`), i.e. whether the FN direction is actually explored.
 
 Optional second adversary in the TTA direction (`adv_down=True`): the clean images are also
 moved along the gradient that LOWERS the predicted error -- what the latent TTA does at test
@@ -54,6 +61,20 @@ log(1 + FP_hat + a * FN_hat) of the moved images has to be `adv_down_target_log_
 below that of their clean originals.  0.5 in log error is roughly the size of the upward
 step (a true Dice drop of 0.1 at Dice ~0.86 multiplies FP + FN by ~1.7, log ~0.54) and about
 what 100 TTA steps take off the head's prediction (-0.63 to -0.67 on 3T->1.5T).
+
+Separate FP and FN heads (`count_output='fp'` / `'fn'`): the head is trained on ONE count only
+-- the regression loss covers only that output, and the (joint-mode) adversary moves the clean
+images along +d log(1 + FP_hat) / dx resp. +d log(1 + FN_hat) / dx; with `adv_down`, the down
+adversary lowers that count.  The network keeps its two outputs (same architecture and
+loading code); the other output receives no gradient and is meaningless.  For the TTA, an FP
+head and an FN head are combined into one (`CombinedFPFNHead`, `attach_fpfn_head(...,
+fn_module=...)`), which returns (log(1+FP_hat) of the FP head, log(1+FN_hat) of the FN head).
+`adv_mode='split'` is not available for single-count heads.
+
+Learning-rate schedule: `ReduceLROnPlateau` monitors `lr_monitor`.  The default 'val_loss'
+includes the adversarial loss from epoch adversarial_skip_epochs + 1 on; that jump is never
+undone, so the scheduler cuts the LR 4x by 10 within ~100 epochs and the head stops learning
+(3.16e-5 -> 3.16e-9 in all heads trained so far).  'val_loss_clean' monitors the clean part only.
 """
 from __future__ import annotations
 
@@ -112,6 +133,11 @@ class FPFNPredictionHead(PredictionHead):
 
 
 COUNT_TARGETS = ('hard', 'soft')
+ADV_MODES = ('joint', 'split')
+COUNT_OUTPUTS = ('both', 'fp', 'fn')   # which count(s) the head is trained on
+LR_MONITORS = ('val_loss', 'val_loss_clean')
+_CHANNEL = {'fp': 0, 'fn': 1}
+ADV_KIND = {'joint': 0, 'fp': 1, 'fn': 2}  # per-sample tag of the up adversary in eval_step
 
 
 def hard_mask(logits: Tensor) -> Tensor:
@@ -190,18 +216,29 @@ class FPFNPredictionLightningModule(L.LightningModule):
         adv_target_dice_drop: float = 0.1,
         adv_controller_gain: float = 0.1,
         adv_fn_weight: float = 1.0,
+        adv_mode: str = 'joint',
         adv_down: bool = False,
         adv_down_target_log_drop: float = 0.5,
+        count_output: str = 'both',
+        lr_monitor: str = 'val_loss',
         metadata: Optional[Dict] = None,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['wrapper'])
         if loss not in ('mse', 'huber'):
             raise ValueError(f"loss must be 'mse' or 'huber', got {loss!r}")
+        if adv_mode not in ADV_MODES:
+            raise ValueError(f"adv_mode must be one of {ADV_MODES}, got {adv_mode!r}")
         if count_target not in COUNT_TARGETS:
             raise ValueError(f"count_target must be one of {COUNT_TARGETS}, got {count_target!r}")
         if perturbations not in ('none', 'predictor'):
             raise ValueError(f"perturbations must be 'none' or 'predictor', got {perturbations!r}")
+        if count_output not in COUNT_OUTPUTS:
+            raise ValueError(f"count_output must be one of {COUNT_OUTPUTS}, got {count_output!r}")
+        if count_output != 'both' and adv_mode != 'joint':
+            raise ValueError("a single-count head (count_output='fp'/'fn') has one adversary: adv_mode='joint'")
+        if lr_monitor not in LR_MONITORS:
+            raise ValueError(f"lr_monitor must be one of {LR_MONITORS}, got {lr_monitor!r}")
         self.wrapper = wrapper
         self.num_classes = int(num_classes)
         self.lr = lr
@@ -214,13 +251,20 @@ class FPFNPredictionLightningModule(L.LightningModule):
         self.adv_target_dice_drop = float(adv_target_dice_drop)
         self.adv_controller_gain = float(adv_controller_gain)
         self.adv_fn_weight = float(adv_fn_weight)
+        self.adv_mode = adv_mode
         self.adv_down = bool(adv_down)
         self.adv_down_target_log_drop = float(adv_down_target_log_drop)
+        self.count_output = count_output
+        self.lr_monitor = lr_monitor
         self.metadata = metadata
 
-        self.adv_gradient_factor = 1.0
+        self.adv_gradient_factor = 1.0      # joint mode
+        self.adv_fp_gradient_factor = 1.0   # split mode, FP half
+        self.adv_fn_gradient_factor = 1.0   # split mode, FN half
         self.adv_down_gradient_factor = 1.0
         self._last_grad_norm = float('nan')
+        self._last_fp_grad_norm = float('nan')
+        self._last_fn_grad_norm = float('nan')
         self._last_down_grad_norm = float('nan')
         # adversarial copies of the previous step's clean batch, trained on in this step
         self.adversarial_batch: Optional[Dict[str, Tensor]] = None
@@ -230,15 +274,17 @@ class FPFNPredictionLightningModule(L.LightningModule):
 
     # -- persistence of the controller state --------------------------------------------
 
+    _FACTORS = ('adv_gradient_factor', 'adv_fp_gradient_factor', 'adv_fn_gradient_factor',
+                'adv_down_gradient_factor')
+
     def on_save_checkpoint(self, checkpoint: Dict) -> None:  # type: ignore[override]
-        checkpoint['adv_gradient_factor'] = float(self.adv_gradient_factor)
-        checkpoint['adv_down_gradient_factor'] = float(self.adv_down_gradient_factor)
+        for k in self._FACTORS:
+            checkpoint[k] = float(getattr(self, k))
 
     def on_load_checkpoint(self, checkpoint: Dict) -> None:  # type: ignore[override]
-        if 'adv_gradient_factor' in checkpoint:
-            self.adv_gradient_factor = float(checkpoint['adv_gradient_factor'])
-        if 'adv_down_gradient_factor' in checkpoint:
-            self.adv_down_gradient_factor = float(checkpoint['adv_down_gradient_factor'])
+        for k in self._FACTORS:
+            if k in checkpoint:
+                setattr(self, k, float(checkpoint[k]))
 
     # -- helpers ------------------------------------------------------------------------
 
@@ -246,13 +292,23 @@ class FPFNPredictionLightningModule(L.LightningModule):
         return self.wrapper(x)
 
     def regression_loss(self, pred: Tensor, target: Tensor) -> Tensor:
-        """Per-sample loss [B] in log(1 + count) space."""
+        """Per-sample loss [B] in log(1 + count) space (only the trained count(s))."""
         pred = pred.float()
         if self.loss_name == 'huber':
             per_elem = F.smooth_l1_loss(pred, target, reduction='none', beta=1.0)
         else:
             per_elem = (pred - target).pow(2)
+        if self.count_output != 'both':
+            per_elem = per_elem[..., _CHANNEL[self.count_output]]
         return per_elem.flatten(1).mean(1)
+
+    def own_error(self, log_counts: Tensor, fn_weight: Optional[float] = None) -> Tensor:
+        """Per-sample [B] error the adversaries act on: log(1 + FP + a FN) for a joint head
+        (a = `adv_fn_weight` unless `fn_weight` is given), log(1 + FP) resp. log(1 + FN) for a
+        single-count head; mean over foreground classes."""
+        if self.count_output == 'both':
+            return log_error(log_counts, self.adv_fn_weight if fn_weight is None else fn_weight)
+        return log_counts[..., _CHANNEL[self.count_output]].float().mean(1)
 
     def adversarial_active(self) -> bool:
         return self.perturbations == 'predictor' and self.current_epoch >= self.adversarial_skip_epochs
@@ -266,35 +322,64 @@ class FPFNPredictionLightningModule(L.LightningModule):
         ramp = self.current_epoch - self.adversarial_skip_epochs
         return min(1.0, (ramp + 1) / self.adversarial_warmup_epochs)
 
+    @staticmethod
+    def _direction(err: Tensor, x_leaf: Tensor, rows: slice):
+        """Per-sample normalized d err / d x for `rows` of `x_leaf`, and its mean L2 norm."""
+        (grad,) = torch.autograd.grad(err, x_leaf, retain_graph=True)
+        grad = torch.nan_to_num(grad[rows].float(), nan=0.0, posinf=0.0, neginf=0.0)
+        norm = grad.flatten(1).norm(2, dim=1).view(-1, 1, 1, 1)
+        return grad / (norm + 1e-8), float(norm.mean().item()) if norm.numel() else float('nan')
+
     def input_gradient(self, x: Tensor, pred: Tensor, x_leaf: Tensor):
-        """Per-sample normalized d log(1 + FP_hat + a FN_hat) / d x and its mean L2 norm.
+        """Per-sample normalized d err / d x and its mean L2 norm, err = `own_error`
+        (log(1 + FP_hat + a FN_hat), or the single count of an FP / FN head).
 
         `pred` must be the head output of the forward pass on `x_leaf` (requires grad);
         rows beyond x.size(0) (adversarial copies in the same batch) are ignored.
         """
         n = x.size(0)
-        err = log_error(pred[:n], self.adv_fn_weight).sum()
-        (grad,) = torch.autograd.grad(err, x_leaf, retain_graph=True)
-        grad = torch.nan_to_num(grad[:n].float(), nan=0.0, posinf=0.0, neginf=0.0)
-        norm = grad.flatten(1).norm(2, dim=1).view(-1, 1, 1, 1)
-        return grad / (norm + 1e-8), float(norm.mean().item())
-
-    def adversarial_input(self, x: Tensor, pred: Tensor, x_leaf: Tensor, factor: float) -> Tensor:
-        """Move `x` one normalized step along +d log(1 + FP_hat + a FN_hat) / d x."""
-        direction, self._last_grad_norm = self.input_gradient(x, pred, x_leaf)
-        return (x.detach() + factor * direction).to(x.dtype).detach()
+        return self._direction(self.own_error(pred[:n]).sum(), x_leaf, slice(0, n))
 
     def adversarial_inputs(self, x: Tensor, pred: Tensor, x_leaf: Tensor):
-        """(up, down): one step that raises the predicted error (step `adv_gradient_factor`)
-        and, with `adv_down`, one that lowers it like the TTA (`adv_down_gradient_factor`;
-        else None).  Both along the same normalized gradient of the clean images."""
-        direction, norm = self.input_gradient(x, pred, x_leaf)
-        self._last_grad_norm = self._last_down_grad_norm = norm
-        up = (x.detach() + self.adv_gradient_factor * direction).to(x.dtype).detach()
+        """(up, down, n_fp): steps that raise the predicted error and, with `adv_down`, one
+        that lowers it like the TTA (`adv_down_gradient_factor`; else down = None).
+
+        joint : all clean images along +d err (`adv_gradient_factor`), err = log(1 + FP_hat +
+                a FN_hat), or log(1 + FP_hat) / log(1 + FN_hat) for a single-count head;
+                n_fp = None.  `down` goes along the same direction, reversed.
+        split : rows [:n_fp] (n_fp = n // 2) along +d log(1 + FP_hat) (`adv_fp_gradient_factor`),
+                rows [n_fp:] along +d log(1 + FN_hat) (`adv_fn_gradient_factor`).  `down` keeps
+                the joint direction (lowering the TTA's objective), on all rows.
+        """
+        n = x.size(0)
+        xd = x.detach()
+        joint = None
+        if self.adv_mode == 'joint':
+            n_fp = None
+            joint, self._last_grad_norm = self.input_gradient(x, pred, x_leaf)
+            up = xd + self.adv_gradient_factor * joint
+        else:
+            n_fp = n // 2
+            fp_rows, fn_rows = slice(0, n_fp), slice(n_fp, n)
+            # pred holds log(1 + count) per foreground class: [B, C-1, (fp, fn)]
+            d_fp, self._last_fp_grad_norm = self._direction(pred[fp_rows, :, 0].sum(), x_leaf, fp_rows)
+            d_fn, self._last_fn_grad_norm = self._direction(pred[fn_rows, :, 1].sum(), x_leaf, fn_rows)
+            up = xd + torch.cat([self.adv_fp_gradient_factor * d_fp,
+                                 self.adv_fn_gradient_factor * d_fn])
         down = None
         if self.adv_down:
-            down = (x.detach() - self.adv_down_gradient_factor * direction).to(x.dtype).detach()
-        return up, down
+            if joint is None:
+                joint, self._last_down_grad_norm = self.input_gradient(x, pred, x_leaf)
+            else:
+                self._last_down_grad_norm = self._last_grad_norm
+            down = (xd - self.adv_down_gradient_factor * joint).to(x.dtype).detach()
+        return up.to(x.dtype).detach(), down, n_fp
+
+    def _halves(self, n: int, n_fp: Optional[int]):
+        """[(name, rows)] of the up adversary: [('', all)] (joint) or [('fp', ..), ('fn', ..)]."""
+        if n_fp is None:
+            return [('', slice(0, n))]
+        return [('fp', slice(0, n_fp)), ('fn', slice(n_fp, n))]
 
     # -- training -----------------------------------------------------------------------
 
@@ -335,47 +420,65 @@ class FPFNPredictionLightningModule(L.LightningModule):
             metrics['loss_adv'] = per_sample[up_rows].detach().mean().view(1).cpu()
             # controller (as for the score predictor): did the TRUE hard Dice of the
             # adversarial copies drop by the target, relative to their clean originals?
-            observed = (adv['dice'] - dice[up_rows]).mean()
+            # split mode: one controller per half (FP / FN adversary), same target.
+            drop = adv['dice'] - dice[up_rows]                       # [n_up] true Dice drop
+            dlog = (tgt[up_rows] - adv['true_log_counts']).float()   # [n_up, C-1, 2] rise of log(1+FP|FN)
             target_delta = self.adv_target_dice_drop * self.effective_step_factor()
-            step_error = float(observed.item()) - target_delta
-            self.adv_gradient_factor -= self.adv_controller_gain * step_error
-            self.adv_gradient_factor = float(max(1e-4, min(10.0, self.adv_gradient_factor)))
-            metrics['adv_observed_delta'] = observed.detach().view(1).cpu()
-            metrics['adv_step_error'] = torch.tensor([step_error])
+            metrics['adv_observed_delta'] = drop.detach().mean().view(1).cpu()
+            for name, rows in self._halves(n_up, adv['n_fp']):
+                if drop[rows].numel() == 0:
+                    continue
+                tag = f'adv_{name}_' if name else 'adv_'
+                observed = drop[rows].mean()
+                step_error = float(observed.item()) - target_delta
+                factor = getattr(self, f'{tag}gradient_factor') - self.adv_controller_gain * step_error
+                setattr(self, f'{tag}gradient_factor', float(max(1e-4, min(10.0, factor))))
+                if name:
+                    metrics[f'{tag}observed_delta'] = observed.detach().view(1).cpu()
+                metrics[f'{tag}step_error'] = torch.tensor([step_error])
+                metrics[f'{tag}true_dlog_fp'] = dlog[rows, :, 0].mean().view(1).cpu()
+                metrics[f'{tag}true_dlog_fn'] = dlog[rows, :, 1].mean().view(1).cpu()
         if down is not None:
             metrics['loss_adv_down'] = per_sample[down_rows].detach().mean().view(1).cpu()
             # controller on the PREDICTED error (the true one should not move): did the
             # head's log(1 + FP_hat + a FN_hat) drop by the target relative to the clean
             # originals?  Like the score predictor's concentration adversary.
-            err_down = log_error(pred[down_rows].detach(), self.adv_fn_weight)
+            err_down = self.own_error(pred[down_rows].detach())
             observed_down = (down['pred_log_error'] - err_down).mean()
             target_down = self.adv_down_target_log_drop * self.effective_step_factor()
             down_error = float(observed_down.item()) - target_down
             self.adv_down_gradient_factor -= self.adv_controller_gain * down_error
             self.adv_down_gradient_factor = float(max(1e-4, min(10.0, self.adv_down_gradient_factor)))
-            true_down = (log_error(down['true_log_counts']) - log_error(tgt[down_rows])).mean()
+            true_down = (self.own_error(down['true_log_counts'], 1.0) - self.own_error(tgt[down_rows], 1.0)).mean()
             metrics['adv_down_pred_drop'] = observed_down.detach().view(1).cpu()
             metrics['adv_down_true_drop'] = true_down.detach().view(1).cpu()
             metrics['adv_down_dice_gain'] = (dice[down_rows] - down['dice']).mean().detach().view(1).cpu()
 
         if use_adv:
-            adv_x, down_x = self.adversarial_inputs(x, pred, x_all)
+            adv_x, down_x, n_fp = self.adversarial_inputs(x, pred, x_all)
             self.adversarial_batch = {
                 'input': adv_x,
                 'target': t.detach(),
                 'dice': dice[:n].detach(),
+                'true_log_counts': tgt[:n].detach(),
+                'n_fp': n_fp,   # split mode: rows [:n_fp] FP adversary, rest FN; None = joint
             }
             if down_x is not None:
                 self.adversarial_down_batch = {
                     'input': down_x,
                     'target': t.detach(),
                     'dice': dice[:n].detach(),
-                    'pred_log_error': log_error(pred[:n].detach(), self.adv_fn_weight),
+                    'pred_log_error': self.own_error(pred[:n].detach()),
                     'true_log_counts': tgt[:n].detach(),
                 }
                 metrics['adv_down_gradient_factor'] = torch.tensor([self.adv_down_gradient_factor])
-            metrics['adv_gradient_factor'] = torch.tensor([self.adv_gradient_factor])
-            metrics['adv_grad_norm'] = torch.tensor([self._last_grad_norm])
+            if n_fp is None:
+                metrics['adv_gradient_factor'] = torch.tensor([self.adv_gradient_factor])
+                metrics['adv_grad_norm'] = torch.tensor([self._last_grad_norm])
+            else:
+                for name in ('fp', 'fn'):
+                    metrics[f'adv_{name}_gradient_factor'] = torch.tensor([getattr(self, f'adv_{name}_gradient_factor')])
+                    metrics[f'adv_{name}_grad_norm'] = torch.tensor([getattr(self, f'_last_{name}_grad_norm')])
 
         self.training_step_outputs.append(metrics)
         return loss
@@ -388,12 +491,23 @@ class FPFNPredictionLightningModule(L.LightningModule):
             name = 'train_loss' if key == 'loss' else f'train_{key}'
             self.log(name, vals.mean(), on_epoch=True, prog_bar=key == 'loss', logger=True)
         self.log('effective_step_factor', self.effective_step_factor(), on_epoch=True, logger=True)
-        if 'adv_gradient_factor' in keys:  # plain-text trace for log files (no wandb)
-            mean = lambda k: torch.cat([o[k] for o in outs if k in o]).mean().item() if k in keys else float('nan')
+        # plain-text trace for log files (no wandb)
+        mean = lambda k: torch.cat([o[k] for o in outs if k in o]).float().nanmean().item() if k in keys else float('nan')
+        target_txt = f"(target {self.adv_target_dice_drop * self.effective_step_factor():.3f})"
+        if 'adv_gradient_factor' in keys:
             print(f"[epoch {self.current_epoch}] loss clean {mean('loss_clean'):.3f} adv {mean('loss_adv'):.3f}"
                   f" | adv factor {self.adv_gradient_factor:.3f} grad norm {mean('adv_grad_norm'):.2e}"
-                  f" true Dice drop {mean('adv_observed_delta'):+.3f}"
-                  f" (target {self.adv_target_dice_drop * self.effective_step_factor():.3f})")
+                  f" true Dice drop {mean('adv_observed_delta'):+.3f} {target_txt}"
+                  f" true dlog FP {mean('adv_true_dlog_fp'):+.3f} FN {mean('adv_true_dlog_fn'):+.3f}")
+        if 'adv_fp_gradient_factor' in keys:
+            print(f"[epoch {self.current_epoch}] loss clean {mean('loss_clean'):.3f} adv {mean('loss_adv'):.3f} {target_txt}")
+            for name in ('fp', 'fn'):
+                print(f"[epoch {self.current_epoch}]   {name.upper()} adversary: factor"
+                      f" {getattr(self, f'adv_{name}_gradient_factor'):.3f}"
+                      f" grad norm {mean(f'adv_{name}_grad_norm'):.2e}"
+                      f" true Dice drop {mean(f'adv_{name}_observed_delta'):+.3f}"
+                      f" true dlog FP {mean(f'adv_{name}_true_dlog_fp'):+.3f}"
+                      f" FN {mean(f'adv_{name}_true_dlog_fn'):+.3f}")
         if 'adv_down_gradient_factor' in keys:
             print(f"[epoch {self.current_epoch}] down: loss {mean('loss_adv_down'):.3f}"
                   f" | factor {self.adv_down_gradient_factor:.3f}"
@@ -424,7 +538,10 @@ class FPFNPredictionLightningModule(L.LightningModule):
             'loss': self.regression_loss(pred, tgt).detach().cpu(),
         }
         if adversarial:
-            adv_x, down_x = self.adversarial_inputs(x, pred, x_leaf)
+            adv_x, down_x, n_fp = self.adversarial_inputs(x, pred, x_leaf)
+            kind = torch.full((x.size(0),), ADV_KIND['joint'], dtype=torch.long)
+            if n_fp is not None:
+                kind[:n_fp], kind[n_fp:] = ADV_KIND['fp'], ADV_KIND['fn']
             if down_x is not None:
                 with torch.no_grad():
                     logits_d = self(down_x)
@@ -433,9 +550,9 @@ class FPFNPredictionLightningModule(L.LightningModule):
                     dice_d = hard_dice(logits_d, t, self.num_classes)
                 out.update({
                     'adv_down_loss': self.regression_loss(pred_d, tgt_d).cpu(),
-                    'adv_down_pred_drop': (log_error(pred.detach(), self.adv_fn_weight)
-                                           - log_error(pred_d, self.adv_fn_weight)).float().cpu(),
-                    'adv_down_true_drop': (log_error(tgt) - log_error(tgt_d)).float().cpu(),
+                    'adv_down_pred_drop': (self.own_error(pred.detach())
+                                           - self.own_error(pred_d)).float().cpu(),
+                    'adv_down_true_drop': (self.own_error(tgt, 1.0) - self.own_error(tgt_d, 1.0)).float().cpu(),
                     'adv_down_dice_gain': (dice_d - dice).cpu(),
                 })
             with torch.no_grad():
@@ -448,6 +565,8 @@ class FPFNPredictionLightningModule(L.LightningModule):
                 'adv_target': tgt_a.cpu(),
                 'adv_dice_drop': (dice - dice_a).cpu(),
                 'adv_loss': self.regression_loss(pred_a, tgt_a).cpu(),
+                'adv_kind': kind,                                  # ADV_KIND per sample
+                'adv_true_dlog': (tgt_a - tgt).float().cpu(),      # [B, C-1, 2] rise of log(1+FP|FN)
             })
         return out
 
@@ -469,6 +588,15 @@ class FPFNPredictionLightningModule(L.LightningModule):
         for k in ('adv_down_loss', 'adv_down_pred_drop', 'adv_down_true_drop', 'adv_down_dice_gain'):
             if k in outs:
                 self.log(f'val_{k}', outs[k].float().mean(), on_epoch=True, logger=True)
+        if 'adv_kind' in outs:  # per up adversary: true Dice drop and rise of the true log counts
+            for name, code in ADV_KIND.items():
+                sel = outs['adv_kind'] == code
+                if not sel.any():
+                    continue
+                tag = 'val_adv' if name == 'joint' else f'val_adv_{name}'
+                self.log(f'{tag}_dice_drop', outs['adv_dice_drop'][sel].float().mean(), on_epoch=True, logger=True)
+                self.log(f'{tag}_true_dlog_fp', outs['adv_true_dlog'][sel][..., 0].mean(), on_epoch=True, logger=True)
+                self.log(f'{tag}_true_dlog_fn', outs['adv_true_dlog'][sel][..., 1].mean(), on_epoch=True, logger=True)
         for name, val in summary_metrics(outs).items():
             self.log(f'val_{name}', val, on_epoch=True, logger=True)
         self.val_step_outputs.clear()
@@ -482,7 +610,7 @@ class FPFNPredictionLightningModule(L.LightningModule):
             'optimizer': optimizer,
             'lr_scheduler': {
                 'scheduler': ReduceLROnPlateau(optimizer, mode='min', patience=self.patience),
-                'monitor': 'val_loss',
+                'monitor': self.lr_monitor,
                 'frequency': 1,
             },
         }
@@ -558,8 +686,11 @@ def get_fpfn_prediction_module(
         adv_target_dice_drop=float(model_cfg.adv_target_dice_drop),
         adv_controller_gain=float(getattr(model_cfg, 'adv_controller_gain', 0.1)),
         adv_fn_weight=float(getattr(model_cfg, 'adv_fn_weight', 1.0)),
+        adv_mode=str(getattr(model_cfg, 'adv_mode', 'joint')),  # old heads: joint
         adv_down=bool(getattr(model_cfg, 'adv_down', False)),
         adv_down_target_log_drop=float(getattr(model_cfg, 'adv_down_target_log_drop', 0.5)),
+        count_output=str(getattr(model_cfg, 'count_output', 'both')),   # old heads: both
+        lr_monitor=str(getattr(model_cfg, 'lr_monitor', 'val_loss')),
         metadata=metadata,
     )
     if ckpt is None:
@@ -587,13 +718,21 @@ def load_fpfn_head(ckpt_path: str, data_cfg, unet: nn.Module, device: str = 'cud
     return module, meta
 
 
-def attach_fpfn_head(wrapper: ScorePredictionWrapper, module: FPFNPredictionLightningModule) -> None:
-    """Let the FP/FN head read the features of `wrapper` (the score predictor's wrapper).
+class CombinedFPFNHead(nn.Module):
+    """FP from an FP-only head and FN from an FN-only head: [B, C-1, 2] like a joint head."""
 
-    Both must record the same swivels with the same placement, otherwise the head would
-    receive features it was not trained on.  After every `wrapper(x)`,
-    `wrapper.extra_predictions[FPFN_HEAD]` holds [B, C-1, 2] = (log(1+FP_hat), log(1+FN_hat)).
-    """
+    def __init__(self, fp_head: nn.Module, fn_head: nn.Module):
+        super().__init__()
+        self.fp_head, self.fn_head = fp_head, fn_head
+
+    def forward(self, feats: dict) -> Tensor:
+        # the feature fuser re-keys its input dict in place: every head gets its own copy
+        fp = self.fp_head(dict(feats))[..., 0]
+        fn = self.fn_head(dict(feats))[..., 1]
+        return torch.stack([fp, fn], dim=-1)
+
+
+def _check_compatible(wrapper: ScorePredictionWrapper, module: FPFNPredictionLightningModule) -> None:
     own = [a.swivel for a in module.wrapper.adapters]
     host = [a.swivel for a in wrapper.adapters]
     if own != host:
@@ -603,7 +742,33 @@ def attach_fpfn_head(wrapper: ScorePredictionWrapper, module: FPFNPredictionLigh
             f'FP/FN head trained with hook placement {module.wrapper.placement!r}, '
             f'score predictor uses {wrapper.placement!r}'
         )
-    head = module.wrapper.prediction_head
+
+
+def attach_fpfn_head(wrapper: ScorePredictionWrapper, module: FPFNPredictionLightningModule,
+                     fn_module: Optional[FPFNPredictionLightningModule] = None) -> None:
+    """Let the FP/FN head read the features of `wrapper` (the score predictor's wrapper).
+
+    Both must record the same swivels with the same placement, otherwise the head would
+    receive features it was not trained on.  After every `wrapper(x)`,
+    `wrapper.extra_predictions[FPFN_HEAD]` holds [B, C-1, 2] = (log(1+FP_hat), log(1+FN_hat)).
+
+    `module` alone must be a joint head (count_output='both').  For separate heads pass the
+    FP-only head as `module` and the FN-only head as `fn_module`.
+    """
+    _check_compatible(wrapper, module)
+    if fn_module is None:
+        if module.count_output != 'both':
+            raise ValueError(f"head trained on {module.count_output!r} only; pass the "
+                             f"{'FN' if module.count_output == 'fp' else 'FP'} head as fn_module / module")
+        head = module.wrapper.prediction_head
+    else:
+        _check_compatible(wrapper, fn_module)
+        if (module.count_output, fn_module.count_output) != ('fp', 'fn'):
+            raise ValueError(f"separate heads must be (fp, fn), got "
+                             f"({module.count_output!r}, {fn_module.count_output!r})")
+        if module.count_target != fn_module.count_target:
+            raise ValueError(f'FP head counts {module.count_target!r}, FN head {fn_module.count_target!r}')
+        head = CombinedFPFNHead(module.wrapper.prediction_head, fn_module.wrapper.prediction_head)
     head.eval()
     wrapper.extra_heads[FPFN_HEAD] = head
 
