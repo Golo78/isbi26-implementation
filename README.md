@@ -122,6 +122,23 @@ Thin wrappers around `eval_latent_tta.sh` that fix the switches and the result d
    (`fp_pred_per_step`, `fn_pred_per_step`). Naming a head (`FPFN_HEAD_NAME`) with the
    default source `oracle` only records its predictions.
 
+8. **FP/FN only** — [src/apps/exp8_fpfn_only.sh](src/apps/exp8_fpfn_only.sh)
+   (`++tta.objective=none`). No mu-hat / kappa in the objective, only log(1 + FP + FN) — true
+   counts (`FPFN_SOURCE=oracle`) or a head (`FPFN_SOURCE=head`). Separate FP-only / FN-only heads
+   are combined with `FPFN_HEAD_NAME` (FP head) + `FPFN_HEAD_NAME_FN` (FN head).
+9. **Pseudo-label oracle** — [src/apps/exp9_pseudo_oracle.sh](src/apps/exp9_pseudo_oracle.sh)
+   (`++tta.fpfn_source=pseudo`). The FP/FN oracle formula against a fixed, corrupted label map
+   g_hat instead of the ground truth: `PSEUDO_MODE=recall` corrects a fraction `PSEUDO_LEVEL` of the
+   un-adapted mask's errors, `PSEUDO_MODE=morph` dilates / erodes the GT by `PSEUDO_LEVEL` px. Tests
+   how good a dense pseudo-label / error-map head would have to be.
+
+FP/FN head variants ([src/model/fpfn_head.py](src/model/fpfn_head.py),
+[train_fpfn_head.sh](src/apps/train_fpfn_head.sh)): `COUNT_TARGET` hard | soft, `ADV_MODE` joint |
+split (one FP and one FN adversary), `ADV_DOWN` (second adversary in the TTA direction),
+`COUNT_OUTPUT` both | fp | fn (separate heads, [run_fpfn_sep_heads_queue.sh](src/apps/run_fpfn_sep_heads_queue.sh)),
+`LR_MONITOR` val_loss | val_loss_clean. NOTE: with the default `val_loss` (which includes the
+adversarial loss from epoch 41 on) the LR scheduler cuts the LR to 3.16e-9 within ~100 epochs.
+
 Every TTA run prints and stores the credible bounds before and after adaptation, so the
 kappa view is available in all experiments, as well as the hard FP / FN counts and mask
 sizes before and after adaptation (over- vs. under-segmentation).
@@ -136,6 +153,10 @@ The 100-step comparison over all PMRI splits and predictors `cleanHalf_0..4`:
   (weights x noise levels x predictors), same round-robin scheme.
 - [src/apps/run_fpfn_oracle_queue.sh](src/apps/run_fpfn_oracle_queue.sh) — FP/FN oracle
   (weights x predictors), same round-robin scheme.
+- [src/apps/run_fpfn_only_queue.sh](src/apps/run_fpfn_only_queue.sh) — experiment 8 (sources x predictors).
+- [src/apps/run_pseudo_oracle_queue.sh](src/apps/run_pseudo_oracle_queue.sh) — experiment 9 (corruption levels x predictors).
+- [src/apps/run_fpfn_head_queue.sh](src/apps/run_fpfn_head_queue.sh),
+  [src/apps/run_fpfn_sep_heads_queue.sh](src/apps/run_fpfn_sep_heads_queue.sh) — FP/FN head training.
 
 Logs go to `logs/`.
 
@@ -156,6 +177,8 @@ Logs go to `logs/`.
 | `latent_tta_mu_fpfn_joint_w<weight>` | pre-norm | sites | mu-hat + true log(1+FP+FN) at every step | `FPFN_FORM=joint` with the same scripts |
 | `latent_tta_mu_fpfn_joint_fn<a>_w<weight>` | pre-norm | sites | mu-hat + true log(1+FP+a*FN) at every step | `FPFN_FORM=joint FPFN_FN_WEIGHT=a` |
 | `latent_tta_mu_fpfnhead[_<form>][_fn<a>]_w<weight>` | pre-norm | sites | mu-hat + predicted log(1+FP+a*FN) (FP/FN head) | `exp7_fpfn_head.sh` |
+| `latent_tta_fpfnonly_<source>[_<head tag>]` | pre-norm | sites | log(1+FP+FN) only (true or head) | `exp8_fpfn_only.sh`, `run_fpfn_only_queue.sh` |
+| `latent_tta_pseudo_<mode><level>` | pre-norm | sites | log(1+FP+FN) against a corrupted label map | `exp9_pseudo_oracle.sh`, `run_pseudo_oracle_queue.sh` |
 | `fpfn_head` | — | — | FP/FN head evaluation (no TTA) | `train_fpfn_head.sh` |
 
 ## Analysis notebooks
@@ -171,6 +194,9 @@ Latent TTA:
 - [src/notebooks/results/latent_tta/](src/notebooks/results/latent_tta/) — per-case analysis, harm and stopping rules, segmentation maps.
 - [src/notebooks/results/latent_tta_20_steps/](src/notebooks/results/latent_tta_20_steps/) — early comparison of 20 / 100 / 1000 ascent steps.
 - [src/notebooks/results/meetings/](src/notebooks/results/meetings/) — status notebooks for the meetings (in German).
+- [src/notebooks/fpfn_findings.ipynb](src/notebooks/fpfn_findings.ipynb) — all FP/FN findings (oracles, heads,
+  head training curves, pseudo-label oracle; in German). Written summary:
+  [docs/fpfn_wissensstand.md](docs/fpfn_wissensstand.md).
 
 The notebooks resolve paths relative to their own location and read from [results/](results/).
 
