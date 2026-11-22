@@ -8,6 +8,7 @@ TODO.md
 **/outputs
 /results
 **/notebooks/testing
+**/docs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
